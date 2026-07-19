@@ -27,7 +27,7 @@ Set `request_client_cert = true` when using SASL EXTERNAL. The TLS engine reques
 
 ## Protocol capabilities
 
-Orochi ships a clean-room, pure-Zig TLS 1.3 stack, Yoroi (`src/crypto/tls_client.zig`, `src/crypto/tls_server.zig`). The live IRC-over-TLS listener uses TLS 1.3; TLS 1.1/1.0, STARTTLS, renegotiation, and record compression all fail closed.
+Orochi ships a clean-room, pure-Zig TLS 1.3 stack, Armor (`src/crypto/tls_client.zig`, `src/crypto/tls_server.zig`). The live IRC-over-TLS listener uses TLS 1.3; TLS 1.1/1.0, STARTTLS, renegotiation, and record compression all fail closed.
 
 A hardened TLS 1.2 client and server engine also exists as standalone modules (`src/crypto/tls12{,_client,_server}.zig`) for interop where TLS 1.3 is unavailable. It is deliberately restricted to ECDHE key exchange with AEAD suites only — ECDHE-ECDSA/RSA with AES-128-GCM, AES-256-GCM, and ChaCha20-Poly1305 over secp256r1 — with no CBC, RC4, static-RSA key exchange, compression, or renegotiation. The TLS 1.2 PRF, key schedule, GCM (RFC 5288) and ChaCha20-Poly1305 (RFC 7905) record layer, and Finished message are all implemented and loopback-tested. Server-side ServerKeyExchange signing is ECDSA-P256.
 
@@ -72,22 +72,22 @@ remaining-lifetime cap, and before the leaf `notAfter`, and the DC signature mus
 verify under the leaf SPKI. The supported leaf-signature schemes are Ed25519,
 ECDSA P-256/SHA-256, and RSA-PSS-RSAE-SHA256.
 
-## `yoroi` — the crypto CLI
+## `armor` — the crypto CLI
 
-`zig build` produces a second binary alongside the daemon: `zig-out/bin/yoroi`, a standalone openssl-parity crypto toolkit backed by the same pure-Zig substrate the daemon uses (`build.zig:458`, `src/cli/yoroi_main.zig:15`). It is convenient for generating and inspecting the certificate material the `[tls]` block consumes without pulling in OpenSSL.
+`zig build` produces a second binary alongside the daemon: `zig-out/bin/armor`, a standalone openssl-parity crypto toolkit backed by the same pure-Zig substrate the daemon uses (`build.zig:458`, `src/cli/armor_main.zig:15`). It is convenient for generating and inspecting the certificate material the `[tls]` block consumes without pulling in OpenSSL.
 
 ```sh
-yoroi genpkey -algorithm ec -out key.pem            # ECDSA P-256 private key (file mode 0600)
-yoroi req -key key.pem -cn irc.example.net -out csr.pem   # PKCS#10 CSR from the key
-yoroi x509 -in cert.pem -text                       # decode/print a certificate
-yoroi x509 -in cert.pem -fingerprint                # SHA-256 fingerprint + SPKI pin
-yoroi verify -CAfile ca.pem cert.pem                # verify a chain against a CA bundle
-yoroi ciphers                                       # list supported suites, groups, sig schemes
-yoroi dgst -sha256 file                             # digest (HMAC key is read from a file, never argv)
-yoroi asn1parse -in cert.der                        # dump a DER structure
+armor genpkey -algorithm ec -out key.pem            # ECDSA P-256 private key (file mode 0600)
+armor req -key key.pem -cn irc.example.net -out csr.pem   # PKCS#10 CSR from the key
+armor x509 -in cert.pem -text                       # decode/print a certificate
+armor x509 -in cert.pem -fingerprint                # SHA-256 fingerprint + SPKI pin
+armor verify -CAfile ca.pem cert.pem                # verify a chain against a CA bundle
+armor ciphers                                       # list supported suites, groups, sig schemes
+armor dgst -sha256 file                             # digest (HMAC key is read from a file, never argv)
+armor asn1parse -in cert.der                        # dump a DER structure
 ```
 
-The full verb set is `x509`, `genpkey`, `pkey`, `req`, `dgst`, `verify`, `rand`, `ciphers`, and `asn1parse`; `s_client`, `s_server`, `enc`, `ocsp`, and `crl` are reserved and exit `3` (not implemented). Run `yoroi <cmd> --help` for per-command options. Exit codes are scriptable: `0` ok, `1` operation failed, `2` usage error, `3` not implemented (`src/cli/yoroi_main.zig:33`). Its focused tests run under `zig build test-cli`.
+The full verb set is `x509`, `genpkey`, `pkey`, `req`, `dgst`, `verify`, `rand`, `ciphers`, and `asn1parse`; `s_client`, `s_server`, `enc`, `ocsp`, and `crl` are reserved and exit `3` (not implemented). Run `armor <cmd> --help` for per-command options. Exit codes are scriptable: `0` ok, `1` operation failed, `2` usage error, `3` not implemented (`src/cli/armor_main.zig:33`). Its focused tests run under `zig build test-cli`.
 
 ## STS
 

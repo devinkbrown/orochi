@@ -108,7 +108,7 @@ journalctl -u orochi -n 100 --no-pager
 
 Then connect an IRC client or run an out-of-band probe against the configured listener.
 
-For a two-node Suimyaku mesh, roll one node at a time: reload the first node,
+For a two-node Undertow mesh, roll one node at a time: reload the first node,
 verify systemd, logs, `/INFO`, `/STATS l`, and that node's
 `[stats].channel_dir/status.json`, then repeat on the peer. Do not cold-restart
 both nodes together unless accepting session loss and a temporary mesh partition.

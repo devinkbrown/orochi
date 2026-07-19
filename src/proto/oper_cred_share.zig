@@ -6,7 +6,7 @@
 //! Passwords NEVER cross the mesh. When an operator authenticates (via SASL)
 //! on the home node, that node mints a signed, expiring "oper authorization
 //! grant" describing the operator's account, privilege bitfield, oper class and
-//! title. The grant propagates over the Suimyaku mesh; any peer holding the
+//! title. The grant propagates over the Undertow mesh; any peer holding the
 //! issuer's Ed25519 public key can verify the grant and recognize the operator
 //! WITHOUT ever seeing the credential that produced it.
 //!
@@ -460,7 +460,7 @@ fn sampleFields() GrantFields {
         .privilege_bits = 0xDEAD_BEEF_0000_0001,
         .class = "netadmin",
         .title = "Network Administrator",
-        .issuer_node = "node-a.suimyaku",
+        .issuer_node = "node-a.undertow",
         .incarnation = 7,
         .issued_ms = 1_000,
         .expiry_ms = 10_000,

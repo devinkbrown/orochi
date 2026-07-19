@@ -22,7 +22,7 @@ There is no `STARTTLS` command; TLS is listener-level implicit TLS (`src/daemon/
 ## NICK
 
 - Syntax: `NICK <nick>`
-- Description: Before registration, stores the nick after validating control bytes and the configured `NICKLEN`; the live server reserves the nick during registration and can close the connection on SACCESS, reservation, nick-delay, or collision failure. After registration, the module handler changes the live nick, updates the world nick registry, broadcasts the `NICK` line, updates MONITOR/WHOWAS/event history, and propagates the change across Suimyaku.
+- Description: Before registration, stores the nick after validating control bytes and the configured `NICKLEN`; the live server reserves the nick during registration and can close the connection on SACCESS, reservation, nick-delay, or collision failure. After registration, the module handler changes the live nick, updates the world nick registry, broadcasts the `NICK` line, updates MONITOR/WHOWAS/event history, and propagates the change across Undertow.
 - Privileges: Any client before registration; registered client afterward.
 - Parameters: `nick` is required.
 - Replies: On registered nick change, broadcasts a `NICK` line to visible peers.

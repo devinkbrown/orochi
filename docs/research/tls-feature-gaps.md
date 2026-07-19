@@ -1,10 +1,10 @@
-# Yoroi TLS/Crypto Stack — Prioritized Feature-Gap Brief
+# Armor TLS/Crypto Stack — Prioritized Feature-Gap Brief
 
 Research brief · 2026-07-11 · analyst: deep-researcher · scope: orochi `src/crypto`, `src/proto`, `src/daemon` + the `orochi` CLI
 
 ## BLUF
 
-**Yoroi is a genuinely complete, modern TLS 1.3 core — not a toy.** It ships full TLS 1.3
+**Armor is a genuinely complete, modern TLS 1.3 core — not a toy.** It ships full TLS 1.3
 client+server, opt-in TLS 1.2, DTLS 1.2/1.3, QUIC, ECH (now RFC 9849), 0-RTT with anti-replay,
 RFC 9345 delegated credentials, RFC 7250 raw public keys, RFC 8879 cert compression, SCT/OCSP/CRL
 handling, session resumption, kTLS offload, and an ACME issuance client. The gaps are at the

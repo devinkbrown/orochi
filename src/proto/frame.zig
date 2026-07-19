@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! SUIMYAKU frame layer.
+//! UNDERTOW frame layer.
 //!
-//! This module sits directly above CoilPack's fixed SUIMYAKU header codec. It
+//! This module sits directly above CoilPack's fixed UNDERTOW header codec. It
 //! keeps frame handling allocation-free: callers provide complete input slices
 //! and output buffers, while transport code owns buffering and I/O.
 const std = @import("std");
 const coilpack = @import("coilpack.zig");
 
-pub const header_len = coilpack.suimyaku_header_len;
+pub const header_len = coilpack.undertow_header_len;
 pub const max_payload_len = std.math.maxInt(u16);
 pub const default_hop_count: u8 = 16;
 pub const default_credit_window: u32 = 4 * 1024 * 1024;
@@ -38,7 +38,7 @@ pub const FrameBand = enum {
     sync,
     irc_app,
     capability,
-    tsumugi,
+    mooring,
     media,
     unknown,
 };
@@ -61,7 +61,7 @@ pub const CtrlFlag = struct {
     pub const dict: u4 = 0x1;
 };
 
-/// Decoded SUIMYAKU control byte: flags[7:4], priority[3:1], compression[0].
+/// Decoded UNDERTOW control byte: flags[7:4], priority[3:1], compression[0].
 pub const Ctrl = struct {
     flags: u4 = 0,
     priority: Priority = .normal,
@@ -90,7 +90,7 @@ pub const Ctrl = struct {
     }
 };
 
-/// SUIMYAKU frame types. Unknown extension values can still be represented and
+/// UNDERTOW frame types. Unknown extension values can still be represented and
 /// classified by their numeric band.
 pub const FrameType = enum(u8) {
     hello = 0x01,
@@ -108,8 +108,8 @@ pub const FrameType = enum(u8) {
     gossip_ack = 0x12,
     ping_req = 0x13,
     ping_req_ack = 0x14,
-    goryu_delta = 0x20,
-    goryu_snapshot = 0x21,
+    concord_delta = 0x20,
+    concord_snapshot = 0x21,
     sync_bloom = 0x22,
     sync_merkle = 0x23,
     sync_want = 0x24,
@@ -131,10 +131,10 @@ pub const FrameType = enum(u8) {
     cap_grant = 0x90,
     cap_revoke = 0x91,
 
-    tsumugi_handshake = 0xa0,
-    tsumugi_handshake_resp = 0xa1,
-    tsumugi_ratchet = 0xa2,
-    tsumugi_group_key = 0xa3,
+    mooring_handshake = 0xa0,
+    mooring_handshake_resp = 0xa1,
+    mooring_ratchet = 0xa2,
+    mooring_group_key = 0xa3,
 
     voice_join = 0xb0,
     voice_leave = 0xb1,
@@ -227,7 +227,7 @@ pub const FrameType = enum(u8) {
             0x10...0x24 => .sync,
             0x80...0x8f => .irc_app,
             0x90...0x91 => .capability,
-            0xa0...0xa3 => .tsumugi,
+            0xa0...0xa3 => .mooring,
             0xb0...0xfd => .media,
             else => .unknown,
         };
@@ -249,8 +249,8 @@ pub const FrameType = enum(u8) {
             .gossip_ack,
             .ping_req,
             .ping_req_ack,
-            .goryu_delta,
-            .goryu_snapshot,
+            .concord_delta,
+            .concord_snapshot,
             .sync_bloom,
             .sync_merkle,
             .sync_want,
@@ -269,10 +269,10 @@ pub const FrameType = enum(u8) {
             .irc_line,
             .cap_grant,
             .cap_revoke,
-            .tsumugi_handshake,
-            .tsumugi_handshake_resp,
-            .tsumugi_ratchet,
-            .tsumugi_group_key,
+            .mooring_handshake,
+            .mooring_handshake_resp,
+            .mooring_ratchet,
+            .mooring_group_key,
             .voice_join,
             .voice_leave,
             .voice_data,
@@ -355,17 +355,17 @@ pub const FrameType = enum(u8) {
         return self.band() == .control;
     }
 
-    pub fn isTsumugi(self: FrameType) bool {
-        return self.band() == .tsumugi;
+    pub fn isMooring(self: FrameType) bool {
+        return self.band() == .mooring;
     }
 
     pub fn debitsCredit(self: FrameType) bool {
-        return !self.isControl() and !self.isTsumugi();
+        return !self.isControl() and !self.isMooring();
     }
 
     pub fn defaultPriority(self: FrameType) Priority {
         return switch (self.band()) {
-            .control, .tsumugi => .control,
+            .control, .mooring => .control,
             .sync => .sync,
             .irc_app => switch (self) {
                 .privmsg, .notice => .high,
@@ -393,7 +393,7 @@ pub const FrameType = enum(u8) {
             .disconnect,
             .credit,
             => true,
-            else => self.isTsumugi(),
+            else => self.isMooring(),
         };
     }
 
@@ -402,7 +402,7 @@ pub const FrameType = enum(u8) {
     }
 };
 
-/// Zero-copy view of one complete SUIMYAKU frame.
+/// Zero-copy view of one complete UNDERTOW frame.
 pub const Frame = struct {
     type: FrameType,
     ctrl: Ctrl,
@@ -463,7 +463,7 @@ pub fn gateFrame(established: bool, frame_type: FrameType) GateDecision {
 
 pub fn creditCost(frame: Frame) u32 {
     if (!frame.type.debitsCredit()) return 0;
-    // Spec (transport-state.md): credit is charged over the full inner SUIMYAKU
+    // Spec (transport-state.md): credit is charged over the full inner UNDERTOW
     // frame size INCLUDING the 8-byte header, keeping sender/receiver accounting
     // symmetric across peers. Clamp to the wire ceiling first so a hand-built
     // oversize payload cannot truncate via @intCast and under-debit the window.
@@ -471,7 +471,7 @@ pub fn creditCost(frame: Frame) u32 {
     return header_len + clamped;
 }
 
-/// Pure SUIMYAKU credit-window accountant. Transport code is responsible for
+/// Pure UNDERTOW credit-window accountant. Transport code is responsible for
 /// serializing returned CREDIT grants and applying received grants.
 pub const CreditWindow = struct {
     remote_available: u32 = default_credit_window,
@@ -570,10 +570,10 @@ test "oversize payloads and buffers are rejected" {
 
 test "band and priority classification" {
     try std.testing.expectEqual(FrameBand.control, FrameType.hello.band());
-    try std.testing.expectEqual(FrameBand.sync, FrameType.goryu_delta.band());
+    try std.testing.expectEqual(FrameBand.sync, FrameType.concord_delta.band());
     try std.testing.expectEqual(FrameBand.irc_app, FrameType.privmsg.band());
     try std.testing.expectEqual(FrameBand.capability, FrameType.cap_grant.band());
-    try std.testing.expectEqual(FrameBand.tsumugi, FrameType.tsumugi_ratchet.band());
+    try std.testing.expectEqual(FrameBand.mooring, FrameType.mooring_ratchet.band());
     try std.testing.expectEqual(FrameBand.media, FrameType.voice_data.band());
     try std.testing.expectEqual(FrameBand.media, FrameType.fromByte(0xf5).band());
     try std.testing.expectEqual(FrameBand.unknown, FrameType.fromByte(0xfe).band());
@@ -582,7 +582,7 @@ test "band and priority classification" {
     try std.testing.expectEqual(Priority.sync, FrameType.sync_merkle.defaultPriority());
     try std.testing.expectEqual(Priority.high, FrameType.privmsg.defaultPriority());
     try std.testing.expectEqual(Priority.normal, FrameType.cap_grant.defaultPriority());
-    try std.testing.expectEqual(Priority.control, FrameType.tsumugi_handshake.defaultPriority());
+    try std.testing.expectEqual(Priority.control, FrameType.mooring_handshake.defaultPriority());
     try std.testing.expectEqual(Priority.realtime, FrameType.voice_data.defaultPriority());
 }
 
@@ -629,18 +629,18 @@ test "credit debit and grant threshold behavior" {
     try window.applyCredit(grant.?);
     try std.testing.expectEqual(default_credit_window - cost + cost * 2, window.remote_available);
 
-    // Control and TSUMUGI frames never debit the window.
+    // Control and MOORING frames never debit the window.
     const before = window.remote_available;
     const control = Frame{ .type = .ping, .ctrl = Ctrl.init(0, .control, false), .payload = &data };
     try window.debitSend(control);
     try std.testing.expectEqual(before, window.remote_available);
 
-    const tsumugi = Frame{ .type = .tsumugi_ratchet, .ctrl = Ctrl.init(0, .control, false), .payload = &data };
-    try window.debitSend(tsumugi);
+    const mooring = Frame{ .type = .mooring_ratchet, .ctrl = Ctrl.init(0, .control, false), .payload = &data };
+    try window.debitSend(mooring);
     try std.testing.expectEqual(before, window.remote_available);
 }
 
-test "pre established gating accepts handshake control tsumugi ping and credit only" {
+test "pre established gating accepts handshake control mooring ping and credit only" {
     try std.testing.expectEqual(GateDecision.accept, gateFrame(false, .hello));
     try std.testing.expectEqual(GateDecision.accept, gateFrame(false, .auth));
     try std.testing.expectEqual(GateDecision.accept, gateFrame(false, .auth_ok));
@@ -648,10 +648,10 @@ test "pre established gating accepts handshake control tsumugi ping and credit o
     try std.testing.expectEqual(GateDecision.accept, gateFrame(false, .ping));
     try std.testing.expectEqual(GateDecision.accept, gateFrame(false, .pong));
     try std.testing.expectEqual(GateDecision.accept, gateFrame(false, .credit));
-    try std.testing.expectEqual(GateDecision.accept, gateFrame(false, .tsumugi_handshake));
+    try std.testing.expectEqual(GateDecision.accept, gateFrame(false, .mooring_handshake));
 
     try std.testing.expectEqual(GateDecision.drop, gateFrame(false, .privmsg));
-    try std.testing.expectEqual(GateDecision.drop, gateFrame(false, .goryu_delta));
+    try std.testing.expectEqual(GateDecision.drop, gateFrame(false, .concord_delta));
     try std.testing.expectEqual(GateDecision.drop, gateFrame(false, .cap_grant));
     try std.testing.expectEqual(GateDecision.drop, gateFrame(false, .voice_data));
 

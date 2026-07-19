@@ -5,7 +5,7 @@
 //!
 //! Today a client's session-resume token is only honored by the node that
 //! issued it. This module produces a portable, integrity-protected reclaim
-//! token that any Suimyaku mesh node can verify using the shared mesh key,
+//! token that any Undertow mesh node can verify using the shared mesh key,
 //! without trusting the presenting client.
 //!
 //! A token is a canonical, length-prefixed serialization of `ReclaimFields`

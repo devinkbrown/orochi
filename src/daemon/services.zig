@@ -121,7 +121,7 @@ comptime {
     if (@typeInfo(ServiceError).error_set.error_names == null) @compileError("ServiceError must remain concrete");
 }
 
-/// Optional integration hook for the daemon's SUIMYAKU state.
+/// Optional integration hook for the daemon's UNDERTOW state.
 pub const StateHook = struct {
     ptr: *anyopaque,
     create_channel: *const fn (ctx: *anyopaque, channel: []const u8) ServiceError!void,

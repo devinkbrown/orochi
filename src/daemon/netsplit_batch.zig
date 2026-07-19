@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Pure IRCv3 netsplit/netjoin BATCH formatter for Suimyaku peer transitions.
+//! Pure IRCv3 netsplit/netjoin BATCH formatter for Undertow peer transitions.
 //!
 //! Callers decide recipients and per-channel fan-out. This module only renders
 //! wire bytes into caller-owned storage and never allocates.

@@ -1,8 +1,8 @@
 {
-  "$comment": "Canonical cross-repo known-answer test for the WS/browser media datagram MAC. Shared byte-for-byte between Orochi (src/substrate/kagura_frame.zig test 'ws-media MAC cross-repo KAT') and the Onyx client (src/lib/suimyaku-media/mediaMac.test.ts). Any change to the derivation or tag MUST update both repos in lockstep.",
+  "$comment": "Canonical cross-repo known-answer test for the WS/browser media datagram MAC. Shared byte-for-byte between Orochi (src/substrate/cadence_frame.zig test 'ws-media MAC cross-repo KAT') and the Onyx client (src/lib/suimyaku-media/mediaMac.test.ts). Any change to the derivation or tag MUST update both repos in lockstep.",
   "scheme": {
     "transport": "browser<->browser media rides binary WebSocket frames on the IRC WSS; server is an SFU/relay that lenient-verifies the sender MAC and forwards the binary frame verbatim to the channel's other on-node call members",
-    "frame": "kagura_frame wire format, optionally followed by a 16-byte MAC tag (identical to the native UDP path)",
+    "frame": "cadence_frame wire format, optionally followed by a 16-byte MAC tag (identical to the native UDP path)",
     "derive_key": "K32 = HMAC-SHA256(key = HMAC-SHA256(key='orochi native-media mac extract v1', msg=root16), msg = 'orochi native-media datagram mac v1' || 0x00 || channel || 0x00 || participant || 0x01)",
     "tag": "tag16 = HMAC-SHA256(K32, frame_bytes)[0..16]",
     "key_issuance": "server derives K32 from its per-process root + (channel, participant) and hands it to the owning participant at MEDIA JOIN over the authenticated WS: ':server EVENT <nick> MEDIA MACKEY <#chan> <base64 K32>'. The browser HMACs with its issued K32; the server re-derives to verify (stateless)."

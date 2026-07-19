@@ -20,7 +20,7 @@
 //! to the peer that delivered it, including across checkpoint restore.
 
 const std = @import("std");
-const message_relay_v2 = @import("../substrate/suimyaku/message_relay_v2.zig");
+const message_relay_v2 = @import("../substrate/undertow/message_relay_v2.zig");
 
 pub const RelayId = message_relay_v2.RelayId;
 pub const unbound_peer: u64 = 0;
@@ -641,7 +641,7 @@ fn makeTestSigned(
     text: []const u8,
 ) !TestSigned {
     const sign = @import("../crypto/sign.zig");
-    const signed_frame = @import("../substrate/suimyaku/signed_frame.zig");
+    const signed_frame = @import("../substrate/undertow/signed_frame.zig");
     var kp = try sign.KeyPair.fromSeed(@as([sign.seed_len]u8, @splat(seed)));
     defer kp.deinit();
     var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;

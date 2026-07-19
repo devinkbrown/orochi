@@ -6,7 +6,7 @@
 //! This module wraps Zig 0.16's `std.crypto.sign.Ed25519` key/public/signature
 //! encodings while keeping private key material behind `Secret(T)`. Signing is
 //! deterministic RFC 8032 Ed25519, with a zero-allocation domain-separated path
-//! for Suimyaku/MeshPass uses where signatures must not be reusable across
+//! for Undertow/MeshPass uses where signatures must not be reusable across
 //! node identity, capability token, and operator challenge contexts.
 const std = @import("std");
 const Secret = @import("secret.zig").Secret;
@@ -37,7 +37,7 @@ const domain_prefix_magic = "orochi-ed25519ctx-v1";
 
 /// The `infix` in signCtxInfix/verifyCtxInfix is concatenated with `msg` WITHOUT
 /// a length delimiter, so (infix="AB",msg="C") and (infix="A",msg="BC") would
-/// sign identical bytes. Every real caller (suimyaku signed_frame) passes a
+/// sign identical bytes. Every real caller (undertow signed_frame) passes a
 /// fixed-width 1-byte frame-type tag, so we enforce that width here — a future
 /// variable-length infix is rejected fail-closed rather than producing an
 /// ambiguous signature. AUDIT every caller before widening this.

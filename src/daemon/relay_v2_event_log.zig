@@ -17,7 +17,7 @@
 //! RVG2 remains the mandatory retained replay/equivocation authority for that ID.
 
 const std = @import("std");
-const message_relay_v2 = @import("../substrate/suimyaku/message_relay_v2.zig");
+const message_relay_v2 = @import("../substrate/undertow/message_relay_v2.zig");
 
 pub const RelayId = message_relay_v2.RelayId;
 
@@ -1491,7 +1491,7 @@ fn makeTestWire(
     hlc: u64,
     text: []const u8,
 ) !TestWire {
-    const signed_frame = @import("../substrate/suimyaku/signed_frame.zig");
+    const signed_frame = @import("../substrate/undertow/signed_frame.zig");
     var pubkey: [message_relay_v2.pubkey_len]u8 = undefined;
     var signature: [message_relay_v2.sig_len]u8 = undefined;
     var msg = message_relay_v2.RelayMessage{

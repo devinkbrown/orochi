@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Known-answer tests for TSUMUGI key exchange.
+//! Known-answer tests for MOORING key exchange.
 const std = @import("std");
 const kx = @import("kx.zig");
 

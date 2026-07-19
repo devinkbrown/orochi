@@ -3,9 +3,9 @@
 *The complete guide, architecture, and reference for the Orochi IRC daemon — grounded in, and cited against, the live source.*
 
 Orochi is a pure-Zig (0.17-dev) clean-room IRC daemon, built from first principles — not a
-clone of any prior daemon. It speaks IRCv3 + IRCX, runs a custom Suimyaku CRDT mesh with
-forward-secret Tsumugi server links, and ships its own pure-Zig TLS (Yoroi), media codecs
-(KaguraVox/KaguraVis), and in-place upgrade (Helix).
+clone of any prior daemon. It speaks IRCv3 + IRCX, runs a custom Undertow CRDT mesh with
+forward-secret Mooring server links, and ships its own pure-Zig TLS (Armor), media codecs
+(CadenceVox/CadenceVis), and in-place upgrade (Helix).
 
 The current daemon surface includes `[class.*]` connection classes for registration-time
 resource/admission/flood policy, bounded growable SendQ and RecvQ, optional nick-delay
@@ -15,7 +15,7 @@ richer `INFO`.
 **New here?** Start with the [Quickstart](guide/00-quickstart.md), then the
 [architecture overview](architecture/00-overview.md). The
 [codename glossary](reference/glossary.md) decodes the mythos vocabulary
-(Suimyaku, Tsumugi, Sazanami, Helix, Yoroi, …).
+(Undertow, Mooring, Ripple, Helix, Armor, …).
 
 ## Operations
 
@@ -28,9 +28,9 @@ richer `INFO`.
 - [Quickstart](guide/00-quickstart.md) — build, configure, and run in minutes
 - [Building](guide/build.md) — build targets and cross-compilation
 - [Testing](guide/testing.md) — focused test lanes, smoke gates, and deterministic assurance
-- [TLS](guide/tls.md) — the Yoroi stack, certificates, and mTLS
+- [TLS](guide/tls.md) — the Armor stack, certificates, and mTLS
 - [Operators](guide/operators.md) — SASL-only operator setup and tooling
-- [Mesh / S2S linking](guide/mesh.md) — linking nodes into a Suimyaku mesh
+- [Mesh / S2S linking](guide/mesh.md) — linking nodes into an Undertow mesh
 - [In-place upgrade](guide/upgrade.md) — session-preserving `USR2` hot-upgrades
 - [Persistence](guide/persistence.md) — the OroStore key/value store
 
@@ -39,9 +39,9 @@ richer `INFO`.
 - [Overview](architecture/00-overview.md) — subsystems, request flow, source map
 - [Reactor & threading](architecture/01-reactor-threading.md) — `io_uring` and sharded workers
 - [World, dispatch & modules](architecture/02-world-dispatch-modules.md) — the SerpentRegistry command system
-- [Mesh & S2S](architecture/mesh-s2s.md) — Suimyaku CRDT, links, partition detection, oper-grant sharing
+- [Mesh & S2S](architecture/mesh-s2s.md) — Undertow CRDT, links, partition detection, oper-grant sharing
 - [Mesh security](architecture/mesh-security.md) — threat model, AEAD record layer, origin signing, media capabilities
-- [Cryptography](architecture/crypto.md) — the Tsumugi handshake, Yoroi, signing, sealed tokens
+- [Cryptography](architecture/crypto.md) — the Mooring handshake, Armor, signing, sealed tokens
 - [Media](architecture/03-media.md) — SFU, transport stack, codecs, WASM shims
 - [Upgrade & WASM host](architecture/04-upgrade-wasm.md) — Helix in-place upgrade, OroWasm plugins
 - [Event Spine](architecture/event-spine.md) — typed operator/observer events: subscription, severity, replay, stats, flood-collapse
@@ -61,6 +61,7 @@ authoritative.
 - [OCSP stapling](dev/tls-design/ocsp-stapling.md) — must-staple, freshness, delegated responders
 - [E2EE Everywhere (Kintsugi)](design/e2ee-everywhere-blueprint.md) — group/channel end-to-end encryption blueprint (design)
 - [Adversarial exploit-suite blueprint](research/exploit-suite-blueprint.md) — the direction for a `test-exploit` fail-closed attack harness (`src/security/exploit/`) (research/design)
+- [TLS/SSL library comparison](research/tls-ssl-library-comparison.md) — OpenSSL/BoringSSL/LibreSSL/mbedTLS/wolfSSL governance, licensing, CVE history (external-library background, not an Armor evaluation) (research)
 - [Zig 0.17 porting notes](dev/zig016-notes.md) — language/stdlib migration notes
 
 ## Command reference
@@ -80,7 +81,7 @@ authoritative.
 
 ## Protocol reference
 
-- [Codename glossary](reference/glossary.md) — the mythos vocabulary (Suimyaku, Tsumugi, Sazanami, Helix, Yoroi, Ringlane, Koshi, Tegami, MeshPass) mapped to source
+- [Codename glossary](reference/glossary.md) — the mythos vocabulary (Undertow, Mooring, Ripple, Helix, Armor, Ringlane, Koshi, Tegami, MeshPass) mapped to source
 - [Numerics](reference/protocol/numerics.md)
 - [Modes](reference/protocol/modes.md) — user and channel modes, status prefixes
 - [ISUPPORT (005)](reference/protocol/isupport.md)

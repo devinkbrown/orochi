@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Byte-oriented binary range coder for kagura entropy coding.
+//! Byte-oriented binary range coder for cadence entropy coding.
 //!
 //! The coder uses a fixed 12-bit probability scale and an adaptive binary
 //! model. Callers must use matching model configuration and bit order for

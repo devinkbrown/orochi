@@ -20,16 +20,16 @@ const wasm_abi = @import("../wasm/host/abi.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
 const crypto_sign = @import("../crypto/sign.zig");
 const netsplit_batch = @import("netsplit_batch.zig");
-const message_relay = @import("../substrate/suimyaku/message_relay.zig");
-const message_relay_v2 = @import("../substrate/suimyaku/message_relay_v2.zig");
+const message_relay = @import("../substrate/undertow/message_relay.zig");
+const message_relay_v2 = @import("../substrate/undertow/message_relay_v2.zig");
 const channel_prop_event = @import("../proto/channel_prop_event.zig");
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
 const s2s_frame = @import("../proto/s2s_frame.zig");
 const session_replica_frame = @import("../proto/session_replica_frame.zig");
-const signed_s2s_frame = @import("../substrate/suimyaku/signed_frame.zig");
-const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
-const mesh_uid_alloc = @import("../substrate/suimyaku/uid_alloc.zig");
-const mesh_clock_mod = @import("../substrate/suimyaku/mesh_clock.zig");
+const signed_s2s_frame = @import("../substrate/undertow/signed_frame.zig");
+const s2s_peer_mod = @import("../substrate/undertow/s2s_peer.zig");
+const mesh_uid_alloc = @import("../substrate/undertow/uid_alloc.zig");
+const mesh_clock_mod = @import("../substrate/undertow/mesh_clock.zig");
 const tiered_keys = @import("tiered_keys.zig");
 const svc_akick = @import("svc_akick.zig");
 const svc_resv = @import("svc_resv.zig");
@@ -53,7 +53,7 @@ const svc_enforce = @import("svc_enforce.zig");
 const svc_recover = @import("svc_recover.zig");
 const spamtrap_mod = @import("spamtrap.zig");
 const media_session = @import("../substrate/media_session.zig");
-const kagura_frame = @import("../substrate/kagura_frame.zig");
+const cadence_frame = @import("../substrate/cadence_frame.zig");
 const sdp = @import("../proto/sdp.zig");
 const event_spine = @import("event_spine.zig");
 const event_spine_replay_guard = @import("event_spine_replay_guard.zig");
@@ -85,12 +85,12 @@ const weather_units = @import("../proto/weather_units.zig");
 const serverinfo = @import("../proto/serverinfo.zig");
 const server_about = @import("../proto/server_about.zig");
 const mesh_report = @import("../proto/mesh_report.zig");
-const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
+const partition_detector = @import("../substrate/undertow/partition_detector.zig");
 const mesh_event_log = @import("../proto/mesh_event_log.zig");
 const event_history_mod = @import("event_history.zig");
 const event_collapse_mod = @import("event_collapse.zig");
 const route_report = @import("../proto/route_report.zig");
-const sazanami_report = @import("../proto/sazanami_report.zig");
+const ripple_report = @import("../proto/ripple_report.zig");
 const link_health_mod = @import("link_health.zig");
 const session_reclaim_mesh = @import("../proto/session_reclaim_mesh.zig");
 const session_portability = @import("../proto/session_portability.zig");
@@ -185,7 +185,7 @@ const dtls_fingerprint_mod = @import("../proto/dtls_fingerprint.zig");
 const dtls_peer_verify_mod = @import("../proto/dtls_peer_verify.zig");
 const native_media_mod = @import("native_media_transport.zig");
 const media_bridge_mod = @import("media_bridge.zig");
-const suimyaku_media = @import("../substrate/suimyaku/media.zig");
+const undertow_media = @import("../substrate/undertow/media.zig");
 const simulcast_select = @import("../substrate/simulcast_select.zig");
 const helix_capsule = @import("helix/capsule.zig");
 const helix_handoff = @import("helix/handoff.zig");
@@ -266,7 +266,7 @@ fn bridgeOnNativeFeedback(ctx: *anyopaque, channel: []const u8, sender_stream_id
 }
 
 /// Resolve a native target's learned address from the native transport and send
-/// the rewrapped kagura datagram there.
+/// the rewrapped cadence datagram there.
 fn bridgeSendToNative(ctx: *anyopaque, target: *const media_bridge_mod.Member, bytes: []const u8) void {
     const s: *BridgeSendCtx = @ptrCast(@alignCast(ctx));
     if (s.server.native_media.remoteFor(s.channel, target.id())) |addr|
@@ -274,7 +274,7 @@ fn bridgeSendToNative(ctx: *anyopaque, target: *const media_bridge_mod.Member, b
 }
 
 /// Resolve a native target's learned address and send control-plane feedback
-/// there. Feedback is not a kagura media frame, so it bypasses media-frame MAC
+/// there. Feedback is not a cadence media frame, so it bypasses media-frame MAC
 /// tagging.
 fn bridgeSendFeedbackToNative(ctx: *anyopaque, target: *const media_bridge_mod.Member, bytes: []const u8) void {
     const s: *BridgeSendCtx = @ptrCast(@alignCast(ctx));
@@ -282,7 +282,7 @@ fn bridgeSendFeedbackToNative(ctx: *anyopaque, target: *const media_bridge_mod.M
         s.server.native_media.sendFeedbackTo(addr, bytes);
 }
 
-/// Cross-leg sink invoked by the WebRTC relay: rewrap the RTP frame to kagura
+/// Cross-leg sink invoked by the WebRTC relay: rewrap the RTP frame to cadence
 /// and fan it out to the channel's native members (live addresses per peer).
 fn bridgeOnRtpFrame(ctx: *anyopaque, channel: []const u8, rtp: []const u8, keyframe_hint: bool) void {
     const self: *LinuxServer = @ptrCast(@alignCast(ctx));
@@ -349,7 +349,7 @@ const base64url = @import("../proto/base64url.zig");
 const account_register = @import("../proto/account_register.zig");
 const account_notify = @import("../proto/account_notify.zig");
 const sessions_mod = @import("sessions.zig");
-const tsumugi_hs = @import("../crypto/tsumugi_handshake.zig");
+const mooring_hs = @import("../crypto/mooring_handshake.zig");
 const trace = @import("../proto/trace.zig");
 
 /// Live CHATHISTORY message store (per-channel ring).
@@ -582,7 +582,7 @@ const default_motd_template =
     "Tip: register your account to reserve your nick and unlock services.{/if}{if:oper}\n" ++
     "Operator privileges are active on this connection - wield them with care.{/if}{if:secure}{else}\n" ++
     "Note: this link is not encrypted - reconnect over TLS for privacy.{/if}\n" ++
-    "Orochi - a clean-room, Zig-native IRCX/IRCv3 daemon: Suimyaku CRDT mesh, forward-secret Tsumugi links.";
+    "Orochi - a clean-room, Zig-native IRCX/IRCv3 daemon: Undertow CRDT mesh, forward-secret Mooring links.";
 
 /// Reserved pseudo-channel used to gossip per-user PRESENCE across the mesh.
 ///
@@ -1666,9 +1666,9 @@ pub const Config = struct {
     /// Runtime cap for one UDP media datagram accepted by the WebRTC/native
     /// pumps. Set from `[media].max_frame_bytes` and clamped to the socket bound.
     media_max_frame_bytes: u64 = 64 * 1024,
-    /// Runtime Kagura reorder window for media reassembly. Validated by the
+    /// Runtime Cadence reorder window for media reassembly. Validated by the
     /// config parser to fit the inline reassembly window ceiling.
-    media_reorder_window_frames: u32 = kagura_frame.default_reorder_window_frames,
+    media_reorder_window_frames: u32 = cadence_frame.default_reorder_window_frames,
     /// Runtime SFU participant cap per room, bounded by the inline roster
     /// ceiling in media_room/native media link.
     media_max_participants: usize = media_room.default_max_participants,
@@ -1683,7 +1683,7 @@ pub const Config = struct {
     media_pins_max_msgid_bytes: usize = 64,
     /// Runtime MEDIA REACT token byte cap. Configurable via `[media.reactions]`.
     media_reactions_max_token_bytes: usize = 32,
-    /// Require the native KaguraVox/KaguraVis UDP leg to carry a per-datagram MAC tag.
+    /// Require the native CadenceVox/CadenceVis UDP leg to carry a per-datagram MAC tag.
     /// Defaults false for compatibility until Nexus/Ocean emit matching tags.
     native_media_require_mac: bool = false,
     /// Relay browser media datagrams (binary WebSocket frames) between a
@@ -1732,7 +1732,7 @@ pub const Config = struct {
     /// Bind address (host byte order) for the `/metrics` listener. Defaults to
     /// loopback `127.0.0.1`; only widened deliberately via `[metrics].bind`.
     metrics_bind_addr: u32 = 0x7f00_0001,
-    /// Discord-compatible incoming webhook endpoint (Torii interop). OFF by
+    /// Discord-compatible incoming webhook endpoint (Gateway interop). OFF by
     /// default: when `webhook_enabled` is false the listener never binds and the
     /// `WEBHOOK` command is not registered — byte-identical to a build without
     /// the feature. See webhook.zig / webhook_http.zig.
@@ -1760,7 +1760,7 @@ pub const Config = struct {
     /// reflexive media candidate behind NAT; overrides media_host when it works.
     media_stun_host: []const u8 = "",
     media_stun_port: u16 = 0,
-    /// UDP port for the native media transport (our own KaguraVox/KaguraVis codec leg);
+    /// UDP port for the native media transport (our own CadenceVox/CadenceVis codec leg);
     /// 0 = ephemeral. Bound on boot alongside the WebRTC/UDP media plane.
     native_media_port: u16 = 0,
     /// An already-bound+listening socket fd to ADOPT instead of binding fresh
@@ -1897,7 +1897,7 @@ pub const Config = struct {
     /// advertised (the default-off honesty guard). Borrowed for the server's life.
     sts_value: ?[]const u8 = null,
     /// Optional server-to-server listener port (0 = disabled). Accepts on this
-    /// socket are driven as Suimyaku mesh peers via S2sLink, not IRC clients.
+    /// socket are driven as Undertow mesh peers via S2sLink, not IRC clients.
     s2s_port: u16 = 0,
     /// Parsed `[listen].webtransport` port. The WebTransport listener is not yet
     /// implemented; main logs an explicit diagnostic when this is configured.
@@ -1989,7 +1989,7 @@ pub const Config = struct {
     /// enabling deterministic simulation (DST). Null = real clock (production).
     reactor: ?reactor_mod.Reactor = null,
     /// Optional PQ-secured S2S: when both are set, server-to-server links run the
-    /// Tsumugi AKE (TOFU) before the CRDT stream. Null = plaintext S2S handshake
+    /// Mooring AKE (TOFU) before the CRDT stream. Null = plaintext S2S handshake
     /// (backward compatible). `node_identity` is borrowed (owned by main); `io`
     /// supplies the handshake CSPRNG.
     node_identity: ?*const node_identity.NodeIdentity = null,
@@ -1998,7 +1998,7 @@ pub const Config = struct {
     /// keyfile; server init binds it to the identity actually loaded by main.
     node_public_key: ?[]const u8 = null,
     crypto_io: ?std.Io = null,
-    /// Runtime Suimyaku peer-driver limits/timers/capacities for plaintext and
+    /// Runtime Undertow peer-driver limits/timers/capacities for plaintext and
     /// secured inner S2S links. Configurable via `[mesh.routing]`,
     /// `[mesh.link]`, `[mesh.gossip]`, and `[mesh.sazanami]` Sazanami keys.
     s2s_config: s2s_link.PeerConfig = .{},
@@ -2009,7 +2009,7 @@ pub const Config = struct {
     mesh_admission_token: []const u8 = "",
     /// `[mesh].require_secured` — when true, refuse plaintext S2S entirely: reject
     /// inbound plaintext peers and never dial plaintext outbound links. Only the
-    /// Tsumugi-secured path is permitted; if secured S2S is not configured/available
+    /// Mooring-secured path is permitted; if secured S2S is not configured/available
     /// (`!s2sSecured()`), all S2S is dropped rather than silently falling back to
     /// clear. Signed MeshPass admission roots also require this secured S2S path.
     /// Default false preserves the plaintext fallback for unsigned deployments.
@@ -2019,7 +2019,7 @@ pub const Config = struct {
     mesh_trust_roots: []const []const u8 = &.{},
     /// `[mesh].admission_roots`: signer roots for MeshPass signed-capability
     /// tokens. Distinct from peer node identity pins. Non-empty roots are invalid
-    /// unless Tsumugi secured S2S is configured; signed admission is never enforced
+    /// unless Mooring secured S2S is configured; signed admission is never enforced
     /// on the plaintext S2S path.
     mesh_admission_roots: []const []const u8 = &.{},
     mesh_admission_min_revocation_epoch: u64 = 0,
@@ -2150,7 +2150,7 @@ test "mesh admission roots require secured S2S identity and crypto" {
     });
 }
 
-pub fn mediaReassemblyConfig(config: Config) kagura_frame.ReassemblyConfig {
+pub fn mediaReassemblyConfig(config: Config) cadence_frame.ReassemblyConfig {
     return media_session.reassemblyConfig(.{ .reorder_window_frames = config.media_reorder_window_frames });
 }
 
@@ -2497,10 +2497,10 @@ pub const ConnState = struct {
     /// PRIVMSG/NOTICE. Not client-settable.
     gagged: bool = false,
     /// Non-null for server-to-server peer connections: inbound bytes drive this
-    /// Suimyaku link instead of the IRC line parser. Heap-owned (stable address
+    /// Undertow link instead of the IRC line parser. Heap-owned (stable address
     /// required by the link's self-referential clock); freed in closeConn/deinit.
     s2s: ?*s2s_link.S2sLink = null,
-    /// Non-null for a PQ-SECURED S2S peer: the framed Tsumugi link drives inbound
+    /// Non-null for a PQ-SECURED S2S peer: the framed Mooring link drives inbound
     /// bytes instead of `s2s`. Exactly one of `s2s`/`s2s_secured` is set per peer.
     /// Heap-owned; freed in closeConn/deinit.
     s2s_secured: ?*secured_s2s_link.SecuredLink = null,
@@ -3209,7 +3209,7 @@ const OperPrefixDedup = struct {
 
 /// Security binding for a reusable session snapshot successfully offered to an
 /// authenticated mesh peer. The token is unguessable and the peer id comes from
-/// the Tsumugi handshake; together they let the origin recognize later traffic
+/// the Mooring handshake; together they let the origin recognize later traffic
 /// from a remote attachment without trusting the relay's unsigned account/nick
 /// fields by themselves.
 const SessionReplicaRoute = struct {
@@ -3279,9 +3279,9 @@ pub const LinuxServer = struct {
     /// before the last REHASH still resume for one more window. Null until the
     /// first rotation. See `rotateTicketKey` + tls_resumption.openTicketWithRotation.
     tls_previous_ticket_key: ?tls_resumption.TicketKey = null,
-    /// Per-process secret keying the native-media kagura stream-id derivation.
+    /// Per-process secret keying the native-media cadence stream-id derivation.
     /// The stream id is a server-issued capability the client stamps into every
-    /// kagura frame; keying it makes it unguessable to anyone without the secret,
+    /// cadence frame; keying it makes it unguessable to anyone without the secret,
     /// so an attacker who knows the public (channel, nick) can no longer precompute
     /// a victim's stream id and hijack/inject on the native-media UDP port.
     /// Generated once at init (getrandom via secure_fns).
@@ -3577,7 +3577,7 @@ pub const LinuxServer = struct {
     msg_seq: u64 = 0,
     /// Cross-mesh Hybrid Logical Clock. Its physical base is WALL-CLOCK time so
     /// LWW/collision ordering compares across hosts by recency, not per-node
-    /// uptime (see suimyaku/mesh_clock.zig). Monotonic-guarded so a wall-clock
+    /// uptime (see undertow/mesh_clock.zig). Monotonic-guarded so a wall-clock
     /// step-back never regresses our own writes.
     mesh_clock: mesh_clock_mod.MeshClock = .{},
     /// `messageOne` executes on every reactor shard. Serialize the shared clock
@@ -3770,8 +3770,8 @@ pub const LinuxServer = struct {
     /// Media transport plane: UDP socket + ICE/STUN endpoint registry + pump
     /// thread. Started on boot (`start`), torn down on `deinit`.
     media_plane: media_plane_mod.MediaPlane,
-    /// Native media transport: UDP leg for our own KaguraVox/KaguraVis codec
-    /// (kagura_frame datagrams). Started on boot, torn down on `deinit`.
+    /// Native media transport: UDP leg for our own CadenceVox/CadenceVis codec
+    /// (cadence_frame datagrams). Started on boot, torn down on `deinit`.
     native_media: native_media_mod.NativeMediaTransport,
     /// Per-channel cross-leg bridge roster (native ↔ opt-in WebRTC). Consulted by
     /// the native pump's cross-leg sink; guarded by `media_bridges_mu`.
@@ -4411,14 +4411,14 @@ pub const LinuxServer = struct {
                 }
             }
 
-            // Bring the native media transport online (our own KaguraVox/KaguraVis codec
+            // Bring the native media transport online (our own CadenceVox/CadenceVis codec
             // leg). Independent of the WebRTC plane below; a bind failure logs and
             // the daemon keeps serving IRC.
             self.native_media.start(native_media_mod.any_be, self.config.native_media_port) catch |e| {
                 srvLog("orochi: native media transport disabled ({s})\n", .{@errorName(e)});
             };
             if (self.native_media.port != 0) {
-                srvLog("orochi: native media on UDP :{d} (codec KaguraVox/KaguraVis)\n", .{self.native_media.port});
+                srvLog("orochi: native media on UDP :{d} (codec CadenceVox/CadenceVis)\n", .{self.native_media.port});
                 // Bridge native frames to any opt-in WebRTC members of each channel.
                 self.native_media.setCrossLegSink(.{ .ctx = self, .on_native_frame = bridgeOnNativeFrame, .on_native_feedback = bridgeOnNativeFeedback });
             }
@@ -7338,7 +7338,7 @@ pub const LinuxServer = struct {
         // [mesh].require_secured: refuse plaintext S2S peers. A plaintext link is
         // only ever stood up when secured S2S is unavailable, so a require_secured
         // operator drops the peer rather than relaying in clear. (Secured peers go
-        // through the Tsumugi path below and are unaffected.)
+        // through the Mooring path below and are unaffected.)
         if (is_s2s and self.config.require_secured and !self.s2sSecured()) {
             self.traceLog(.info, .s2s, "refused plaintext S2S peer ([mesh].require_secured)");
             closeFd(fd);
@@ -8119,7 +8119,7 @@ pub const LinuxServer = struct {
         self.forwardAcceptedRelayV2(&.{});
     }
 
-    /// Drive a PQ-secured S2S peer: feed inbound bytes through the framed Tsumugi
+    /// Drive a PQ-secured S2S peer: feed inbound bytes through the framed Mooring
     /// link and queue its outbound. Logs the AKE establishment transition.
     fn driveS2sSecured(self: *LinuxServer, conn: *ConnState, link: *secured_s2s_link.SecuredLink, bytes: []const u8) void {
         const was = link.established();
@@ -8223,7 +8223,7 @@ pub const LinuxServer = struct {
         // secured leg carries these (the capsule holds account/host state).
         self.drainSessionMigrations(link);
         // Drain inbound cross-mesh oper grants. Each is verified against the
-        // peer's authenticated Ed25519 key from the Tsumugi handshake before it
+        // peer's authenticated Ed25519 key from the Mooring handshake before it
         // can confer operator authority locally — an unverifiable grant is
         // silently dropped by applyMeshGrant.
         if (link.peerNodeKey()) |peer_key| {
@@ -22420,7 +22420,7 @@ pub const LinuxServer = struct {
     /// check lives in the `handleUpgrade` wrapper; a signal-triggered upgrade is
     /// implicitly privileged (it came from the service manager / root).
     /// Seal an established secured mesh link for a zero-drop Helix upgrade. Queues
-    /// an `.s2s_link` capsule carrying the link's crypto (Tsumugi record keys +
+    /// an `.s2s_link` capsule carrying the link's crypto (Mooring record keys +
     /// counters), inner framing header, partial-record carry, and all not-yet-sent
     /// outbound bytes. The caller preserves the socket fd (CLOEXEC cleared) so the
     /// peer never sees a drop. Returns true on success; false on ANY failure.
@@ -26242,7 +26242,7 @@ pub const LinuxServer = struct {
 
     /// Re-attach a PRESERVED secured mesh link across a Helix upgrade: take
     /// ownership of its inherited socket fd, rebuild the SecuredLink established
-    /// from the capsule (Tsumugi record keys + counters + inner framing header),
+    /// from the capsule (Mooring record keys + counters + inner framing header),
     /// prime the carried remote-member roster, arm recv, then RESYNC with the
     /// peer + re-burst our state so the roster reconverges within a round-trip —
     /// the peer never saw a drop and local clients never see a spurious re-JOIN.
@@ -26335,7 +26335,7 @@ pub const LinuxServer = struct {
             .expected_remotes = pins[0..pin_count],
             .trusted_node_keys = self.mesh_trusted_node_keys,
         }, .{
-            .established = tsumugi_hs.Established.deserialize(&snap.established),
+            .established = mooring_hs.Established.deserialize(&snap.established),
             .send_counter = snap.send_counter,
             .recv_counter = snap.recv_counter,
             .feed_seq = snap.feed_seq,
@@ -33076,7 +33076,7 @@ pub const LinuxServer = struct {
 
     /// Broadcast a signed oper grant to every established **secured** peer. The
     /// plaintext S2S path is deliberately skipped: a grant only carries authority
-    /// over a link whose peer identity the Tsumugi handshake authenticated.
+    /// over a link whose peer identity the Mooring handshake authenticated.
     fn broadcastOperGrant(self: *LinuxServer, signed: []const u8) void {
         for (self.reactors) |*reactor| {
             for (reactor.clients.slots.items, 0..) |*slot, i| {
@@ -33093,7 +33093,7 @@ pub const LinuxServer = struct {
     /// Broadcast a `mesh`-scope WARD (add or remove) to every established secured
     /// peer so already-running nodes enforce (or forget) the network ban live.
     /// Like `broadcastOperGrant`, the plaintext S2S path is skipped: a network ban
-    /// is operator authority and only rides a Tsumugi-authenticated link. The
+    /// is operator authority and only rides a Mooring-authenticated link. The
     /// `ward` strings are encoded into `wire` once and signed per-peer.
     fn broadcastMeshWard(self: *LinuxServer, ward: warden.Ward, op: warden.WireOp) void {
         var wire_buf: [warden.max_wire_len]u8 = undefined;
@@ -36644,7 +36644,7 @@ pub const LinuxServer = struct {
     }
 
     // -----------------------------------------------------------------------
-    // Live cross-mesh session migration (Helix migration_relay over Suimyaku).
+    // Live cross-mesh session migration (Helix migration_relay over Undertow).
     //
     // A node that holds a detached session ("origin"/owner) ships a signed
     // migration capsule to its secured peers ahead of the client's reconnect.
@@ -39950,7 +39950,7 @@ pub const LinuxServer = struct {
         }
         if (std.ascii.eqlIgnoreCase(sub, "ABR")) {
             // `MEDIA ABR <#chan> <current_kbps> <available_kbps> <loss_pct> <rtt_ms> [nack_per_sec]`
-            // applies the existing Suimyaku ABR hint and simulcast selector to this
+            // applies the existing Undertow ABR hint and simulcast selector to this
             // receiver's native layer ceiling. It is a control-plane hint only; the
             // SFU still forwards opaque codec bytes and never transcodes.
             if (parsed.param_count < 6) {
@@ -39984,7 +39984,7 @@ pub const LinuxServer = struct {
                 }
             else
                 0;
-            const hint = suimyaku_media.abrHint(.{}, .{
+            const hint = undertow_media.abrHint(.{}, .{
                 .current_bitrate_kbps = current_kbps,
                 .available_bitrate_kbps = available_kbps,
                 .packet_loss_percent = loss_pct,
@@ -40192,7 +40192,7 @@ pub const LinuxServer = struct {
     }
 
     /// Ingest one binary-WebSocket media datagram from a registered call
-    /// participant: validate the Kagura frame shape, lenient-verify the per-stream
+    /// participant: validate the Cadence frame shape, lenient-verify the per-stream
     /// MAC, and fan it out to the channel's other on-node call members. Media is
     /// loss-tolerant — any problem drops this datagram, never the IRC session.
     fn handleWsMediaDatagram(self: *LinuxServer, id: client_model.ClientId, conn: *ConnState, datagram: []const u8) void {
@@ -40205,7 +40205,7 @@ pub const LinuxServer = struct {
         // One call validates the frame shape AND lenient-verifies a present tag,
         // using the same `native_stream_key`-derived `(channel, participant)` key
         // the native UDP leg uses. On any error the datagram is dropped.
-        _ = kagura_frame.acceptNativeMediaMac(
+        _ = cadence_frame.acceptNativeMediaMac(
             &self.native_stream_key,
             channel,
             participant,
@@ -40249,11 +40249,11 @@ pub const LinuxServer = struct {
     /// participant ever receives its own key; the server re-derives to verify
     /// (stateless).
     fn issueMediaMacKey(self: *LinuxServer, conn: *ConnState, channel: []const u8, participant: []const u8) void {
-        var k32: [kagura_frame.MAC_KEY_BYTES]u8 = undefined;
-        kagura_frame.deriveNativeMediaMacKey(&self.native_stream_key, channel, participant, &k32);
+        var k32: [cadence_frame.MAC_KEY_BYTES]u8 = undefined;
+        cadence_frame.deriveNativeMediaMacKey(&self.native_stream_key, channel, participant, &k32);
         defer std.crypto.secureZero(u8, k32[0..]);
 
-        var b64: [std.base64.standard.Encoder.calcSize(kagura_frame.MAC_KEY_BYTES)]u8 = undefined;
+        var b64: [std.base64.standard.Encoder.calcSize(cadence_frame.MAC_KEY_BYTES)]u8 = undefined;
         const enc = std.base64.standard.Encoder.encode(&b64, &k32);
 
         var detail_buf: [128]u8 = undefined;
@@ -40294,17 +40294,18 @@ pub const LinuxServer = struct {
     /// Emit the current call roster for `channel` to the caller as targeted
     /// MEDIA Event Spine replies.
     fn codecTagName(tag: sdp.CodecTag) []const u8 {
+        // TODO(rebrand): wire string still "kaguravox"/"kaguravis" pending client-first rollout
         return switch (tag) {
-            .kaguravox => "kaguravox",
-            .kaguravis => "kaguravis",
+            .cadencevox => "kaguravox",
+            .cadencevis => "kaguravis",
             .raw => "raw",
         };
     }
 
     fn codecMediaKind(tag: sdp.CodecTag) ?media_room.MediaKind {
         return switch (tag) {
-            .kaguravox => .voice,
-            .kaguravis => .video,
+            .cadencevox => .voice,
+            .cadencevis => .video,
             .raw => null,
         };
     }
@@ -40318,8 +40319,8 @@ pub const LinuxServer = struct {
 
     fn bridgeCodecTag(tag: sdp.CodecTag) media_bridge_mod.Codec {
         return switch (tag) {
-            .kaguravox => .kaguravox,
-            .kaguravis => .kaguravis,
+            .cadencevox => .cadencevox,
+            .cadencevis => .cadencevis,
             .raw => .raw,
         };
     }
@@ -40349,15 +40350,16 @@ pub const LinuxServer = struct {
         var it = std.mem.splitScalar(u8, codec_csv, ',');
         while (it.next()) |name| {
             if (name.len == 0 or n >= out.len) continue;
+            // TODO(rebrand): wire string still "kaguravox"/"kaguravis" pending client-first rollout
             const tag: sdp.CodecTag = if (std.ascii.eqlIgnoreCase(name, "kaguravox"))
-                .kaguravox
+                .cadencevox
             else if (std.ascii.eqlIgnoreCase(name, "kaguravis"))
-                .kaguravis
+                .cadencevis
             else if (std.ascii.eqlIgnoreCase(name, "raw"))
                 .raw
             else
                 continue;
-            out[n] = .{ .tag = tag, .clock_rate = if (tag == .kaguravis) 90000 else 48000, .params = 0 };
+            out[n] = .{ .tag = tag, .clock_rate = if (tag == .cadencevis) 90000 else 48000, .params = 0 };
             n += 1;
         }
         return n;
@@ -40401,7 +40403,7 @@ pub const LinuxServer = struct {
         }
     }
 
-    fn mediaAbrActionName(action: suimyaku_media.AbrAction) []const u8 {
+    fn mediaAbrActionName(action: undertow_media.AbrAction) []const u8 {
         return switch (action) {
             .hold => "hold",
             .increase => "increase",
@@ -40423,7 +40425,7 @@ pub const LinuxServer = struct {
         return if (bps > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(bps);
     }
 
-    fn mediaAbrSelection(hint: suimyaku_media.AbrHint) !simulcast_select.Selection {
+    fn mediaAbrSelection(hint: undertow_media.AbrHint) !simulcast_select.Selection {
         const layers = mediaAbrLayers();
         const target_bps = if (hint.action == .pause) layers[0].bitrate_bps else mediaAbrTargetBps(hint.target_bitrate_kbps);
         return simulcast_select.selectStable(&layers, target_bps, null, 50_000);
@@ -40498,6 +40500,7 @@ pub const LinuxServer = struct {
         var cbuf: [4]sdp.Codec = undefined;
         const cn = parseCodecCsv(&cbuf, codec_csv);
         if (cn == 0) {
+            // TODO(rebrand): wire string still "kaguravox"/"kaguravis" pending client-first rollout
             try self.failReply(conn, "MEDIA", "NO_CODECS", "Offer at least one codec: kaguravox,kaguravis,raw");
             return;
         }
@@ -40533,8 +40536,8 @@ pub const LinuxServer = struct {
         const offered_fec = sdp.Fec{ .scheme = .rs_block, .redundancy = 1 };
         const remote = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = cbuf[0..cn], .fec = offered_fec, .direction = .sendrecv };
         const server_codecs = [_]sdp.Codec{
-            .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 },
-            .{ .tag = .kaguravis, .clock_rate = 90000, .params = 0 },
+            .{ .tag = .cadencevox, .clock_rate = 48000, .params = 0 },
+            .{ .tag = .cadencevis, .clock_rate = 90000, .params = 0 },
         };
         const local = sdp.MediaDescription{ .band_id = 64, .kind = .audio, .codecs = &server_codecs, .fec = offered_fec, .direction = .sendrecv };
         var negotiated = media_session.negotiate(self.allocator, local, remote) catch {
@@ -40602,9 +40605,9 @@ pub const LinuxServer = struct {
             }
         }
 
-        // Native transport (our own KaguraVox/KaguraVis codec leg): register this
+        // Native transport (our own CadenceVox/CadenceVis codec leg): register this
         // participant for the channel's native call and advertise the candidate +
-        // the stream_id the client must stamp into its kagura frames. Independent
+        // the stream_id the client must stamp into its cadence frames. Independent
         // of the WebRTC plane above; best-effort (media is optional).
         const stream_id = self.nativeStreamId(channel, nick);
         if (self.native_media.port != 0) {
@@ -40618,6 +40621,7 @@ pub const LinuxServer = struct {
             // remote native client would be told 127.0.0.1 and never reach the SFU.
             var native_host_buf: [16]u8 = undefined;
             const native_cand = self.media_plane.candidateIp(&native_host_buf) orelse self.config.media_host;
+            // TODO(rebrand): wire string still codec=KaguraVox/KaguraVis pending client-first rollout
             const detail = std.fmt.bufPrint(&nbuf, "candidate={s}:{d} stream={d} codec=KaguraVox/KaguraVis{s}", .{
                 native_cand, self.native_media.port, stream_id, mac_token,
             }) catch return;
@@ -40674,8 +40678,8 @@ pub const LinuxServer = struct {
         self.allocator.free(key);
     }
 
-    /// Per-(channel,participant) kagura stream id advertised to the native client;
-    /// it stamps this into every kagura frame it publishes so the SFU can map a
+    /// Per-(channel,participant) cadence stream id advertised to the native client;
+    /// it stamps this into every cadence frame it publishes so the SFU can map a
     /// frame back to its publisher. Keyed by the per-process `native_stream_key`
     /// (a secret PRF), so the id is UNGUESSABLE without that secret: it doubles as
     /// a capability token delivered over the TLS IRC channel, preventing an
@@ -40748,6 +40752,7 @@ pub const LinuxServer = struct {
         var cbuf: [4]sdp.Codec = undefined;
         const cn = parseCodecCsv(&cbuf, codec_csv);
         if (cn == 0) {
+            // TODO(rebrand): wire string still "kaguravox"/"kaguravis" pending client-first rollout
             try self.failReply(conn, "MEDIA", "NO_CODECS", "Answer at least one codec: kaguravox,kaguravis,raw");
             return;
         }
@@ -40792,7 +40797,7 @@ pub const LinuxServer = struct {
             }) catch continue;
             try self.sendMediaEventReply(conn, "STATS", channel, detail);
         }
-        // Native leg (our own KaguraVox/KaguraVis codec) stats.
+        // Native leg (our own CadenceVox/CadenceVis codec) stats.
         var native_stats: [native_media_mod.max_call_participants]native_media_mod.NativeMediaTransport.Stat = undefined;
         const nn = self.native_media.statsForChannel(channel, &native_stats);
         for (native_stats[0..nn]) |s| {
@@ -42627,9 +42632,9 @@ pub const LinuxServer = struct {
                 if (up) peers += 1;
             }
         }
-        if (std.fmt.bufPrint(&b, "Mesh: {d} established S2S peer link(s) - Suimyaku CRDT routing over Tsumugi forward-secret transport", .{peers})) |t| try queueNumeric(conn, .RPL_INFO, &.{}, t) else |_| {}
+        if (std.fmt.bufPrint(&b, "Mesh: {d} established S2S peer link(s) - Undertow CRDT routing over Mooring forward-secret transport", .{peers})) |t| try queueNumeric(conn, .RPL_INFO, &.{}, t) else |_| {}
 
-        try queueNumeric(conn, .RPL_INFO, &.{}, "Subsystems: IRCX + IRCv3, Yoroi TLS 1.3 (+ hardened 1.2), connection classes, Event Spine, CHATHISTORY + bouncer, native voice/video (KaguraVox/KaguraVis)");
+        try queueNumeric(conn, .RPL_INFO, &.{}, "Subsystems: IRCX + IRCv3, Armor TLS 1.3 (+ hardened 1.2), connection classes, Event Spine, CHATHISTORY + bouncer, native voice/video (CadenceVox/CadenceVis)");
     }
 
     /// DIRECTORY — registered-client view of the public discovery-directory
@@ -42696,7 +42701,7 @@ pub const LinuxServer = struct {
         try queueNumeric(conn, .RPL_ENDOFUSERS, &.{}, "End of users");
     }
 
-    /// LINKS — Suimyaku mesh view: this server plus every established S2S peer as
+    /// LINKS — Undertow mesh view: this server plus every established S2S peer as
     /// a 1-hop neighbour (RPL_LINKS 364 / RPL_ENDOFLINKS 365). Reflects both
     /// plaintext and PQ-secured links, matching the MESH peer view.
     pub fn handleLinks(self: *LinuxServer, conn: *ConnState) !void {
@@ -42724,7 +42729,7 @@ pub const LinuxServer = struct {
                 seen_n += 1;
             }
             // The peer's REAL handshake-gossiped description (not a generic).
-            const pdesc = peerDescription(c) orelse "Suimyaku peer";
+            const pdesc = peerDescription(c) orelse "Undertow peer";
             var lbuf: [256]u8 = undefined;
             const ldetail = std.fmt.bufPrint(&lbuf, "1 {s}", .{pdesc}) catch continue;
             try queueNumeric(conn, .RPL_LINKS, &.{ rname, protocol_inventory.currentServerName() }, ldetail);
@@ -42740,7 +42745,7 @@ pub const LinuxServer = struct {
     /// path). Using `remoteNodeId()` here was WRONG for a secured link: it
     /// returns the authenticated Ed25519 shortId, which is a different u64 than
     /// the peer's advertised registry node id, so `nodeDescription` missed and
-    /// LINKS fell back to the generic "Suimyaku peer" placeholder.
+    /// LINKS fell back to the generic "Undertow peer" placeholder.
     fn peerDescription(conn: *const ConnState) ?[]const u8 {
         if (conn.s2s) |l| {
             if (l.established()) if (l.remoteDescription()) |d| if (d.len != 0) return d;
@@ -43235,14 +43240,14 @@ pub const LinuxServer = struct {
         }
     }
 
-    /// NETHEALTH — oper view of mesh node liveness (Sazanami-style): this node plus
+    /// NETHEALTH — oper view of mesh node liveness (Ripple-style): this node plus
     /// each established peer, with link RTT and idle time from the health table.
-    /// Rendered by the pure sazanami_report renderer.
+    /// Rendered by the pure ripple_report renderer.
     pub fn handleNethealth(self: *LinuxServer, conn: *ConnState) !void {
         const now: u64 = @intCast(@max(@as(i64, 0), self.nowMs()));
         var names: [63][]const u8 = undefined;
         const np = self.collectPeers(&names);
-        var nodes: [64]sazanami_report.NodeStatus = undefined;
+        var nodes: [64]ripple_report.NodeStatus = undefined;
         nodes[0] = .{ .node = protocol_inventory.currentServerName(), .health = .alive, .last_ack_ms_ago = 0 };
         for (names[0..np], 0..) |name, i| {
             var rtt: u32 = 0;
@@ -43253,10 +43258,10 @@ pub const LinuxServer = struct {
             }
             nodes[i + 1] = .{ .node = name, .health = .alive, .last_ack_ms_ago = idle, .rtt_ms = rtt };
         }
-        const snap = sazanami_report.HealthSnapshot{ .local_node = protocol_inventory.currentServerName(), .nodes = nodes[0 .. np + 1] };
+        const snap = ripple_report.HealthSnapshot{ .local_node = protocol_inventory.currentServerName(), .nodes = nodes[0 .. np + 1] };
         var body_buf: [4096]u8 = undefined;
         var w = std.Io.Writer.fixed(&body_buf);
-        sazanami_report.renderHealth(snap, &w) catch {};
+        ripple_report.renderHealth(snap, &w) catch {};
         var lines = std.mem.splitScalar(u8, w.buffered(), '\n');
         while (lines.next()) |line| {
             if (line.len == 0) continue;
@@ -45098,7 +45103,7 @@ pub const LinuxServer = struct {
     /// override) — rendered as the `*` status prefix and in WHOIS. Covers both a
     /// local session AND a cross-mesh oper grant propagated from a peer node
     /// (keyed by account; matched to the nick), so a remote server's admins also
-    /// render with `*`. The grant path requires the secured Tsumugi mesh, over
+    /// render with `*`. The grant path requires the secured Mooring mesh, over
     /// which signed grants travel.
     fn isOverrideOper(self: *LinuxServer, nick: []const u8) bool {
         for (self.reactors) |*reactor| {
@@ -45796,7 +45801,7 @@ fn reserveRawAppendToConn(conn: *ConnState, bytes_len: usize) ServerError!void {
         return error.OutputTooSmall;
 }
 
-/// Exact outer Tsumugi record size for one signed SESSION_REPLICA object. A v2
+/// Exact outer Mooring record size for one signed SESSION_REPLICA object. A v2
 /// peer necessarily negotiated the direct signed envelope, and SecuredLink
 /// seals each inner drain into one `[u32 length][ciphertext][tag]` record.
 fn sessionReplicaSecuredRecordLen(signed_payload_len: usize) ?usize {
@@ -68557,6 +68562,7 @@ test "threaded server: media user modes block transmit and hide automatic presen
     try std.testing.expect(std.mem.indexOfScalar(u8, b.written(), 'P') != null);
 }
 
+// TODO(rebrand): MEDIA wire strings below still "kaguravox"/"kaguravis" pending client-first rollout
 test "threaded server: MEDIA OFFER RFC 8122 DTLS signaling (fingerprint/setup vs legacy srtp)" {
     var cfg = multiOperTestConfig(0);
     cfg.media_enabled = true;
@@ -68621,6 +68627,7 @@ test "threaded server: MEDIA OFFER RFC 8122 DTLS signaling (fingerprint/setup vs
     try recvUntil(&a, "FAIL MEDIA BAD_FINGERPRINT", 200);
 }
 
+// TODO(rebrand): MEDIA wire strings below still "kaguravox"/"kaguravis" pending client-first rollout
 test "threaded server: MEDIA OFFER with DTLS off is byte-identical + fails closed on a fingerprint request" {
     var cfg = multiOperTestConfig(0);
     cfg.media_enabled = true;
@@ -68668,6 +68675,7 @@ test "threaded server: MEDIA OFFER with DTLS off is byte-identical + fails close
     try std.testing.expect(std.mem.indexOf(u8, a.written(), "srtp=") == null);
 }
 
+// TODO(rebrand): MEDIA wire strings below still "kaguravox"/"kaguravis" pending client-first rollout
 test "threaded server: MEDIA ANSWER provisions transport and native leg" {
     var cfg = multiOperTestConfig(0);
     cfg.media_enabled = true;
@@ -76308,7 +76316,7 @@ const test_line_mesh_checker = sasl.PlainChecker{ .ptr = &test_line_mesh_anchor,
 // (the exact F1 hole). LOCAL delivery is unaffected. The RESTORED multi-device
 // relay under a VERIFIED residence proof is proven deterministically in the
 // route_table / s2s_peer unit tests and the seed-replayable residence DST
-// (`substrate/suimyaku/residence_trust_dst.zig`).
+// (`substrate/undertow/residence_trust_dst.zig`).
 test "threaded server: an UNPROVEN cross-node same-account claim grants no coexistence relay (F1 fail-closed)" {
     if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
     const alloc = std.testing.allocator;

@@ -3,7 +3,7 @@
 
 //! MeshPass admission tokens.
 //!
-//! MeshPass is the Suimyaku mesh admission and capability envelope. The signed
+//! MeshPass is the Undertow mesh admission and capability envelope. The signed
 //! payload is a fixed-order CoilPack schema so byte-for-byte canonical encoding
 //! is what Ed25519 signs and verifies.
 const std = @import("std");
@@ -40,7 +40,7 @@ pub const FrameFamily = enum(u5) {
     sync = 1,
     irc_app = 2,
     capability = 3,
-    tsumugi = 4,
+    mooring = 4,
     media = 5,
 };
 
@@ -173,7 +173,7 @@ pub fn verify(token: Token, trust_root: anytype, now_ms: u64) VerifyError!void {
 }
 
 /// Verify a decoded token, then bind it to the authenticated peer node key and
-/// require every requested SUIMYAKU frame family bit to be present.
+/// require every requested UNDERTOW frame family bit to be present.
 pub fn bindDecodedToken(
     token: Token,
     trust_root: anytype,
@@ -194,7 +194,7 @@ pub fn hasRole(fields: Fields, role: Role) bool {
     return (fields.roles & roleBit(role)) != 0;
 }
 
-/// Return true when `fields` permits the given SUIMYAKU frame family.
+/// Return true when `fields` permits the given UNDERTOW frame family.
 pub fn mayUseFrameFamily(fields: Fields, family: FrameFamily) bool {
     return (fields.allowed_frame_families & frameFamilyBit(family)) != 0;
 }
@@ -333,7 +333,7 @@ fn sampleFields(node_pubkey: PublicKeyBytes) Fields {
         .roles = roles(&.{ .operator, .relay, .media }),
         .issued_ms = 1_000,
         .expiry_ms = 10_000,
-        .allowed_frame_families = frameFamilies(&.{ .control, .sync, .irc_app, .tsumugi }),
+        .allowed_frame_families = frameFamilies(&.{ .control, .sync, .irc_app, .mooring }),
         .max_fanout = 8,
         .media_rights = mediaRights(&.{ .voice, .video }),
         .revocation_epoch = 3,
@@ -367,7 +367,7 @@ test "bind decoded token accepts matching peer and required frame families" {
         issuer.public_key.toBytes(),
         2_000,
         node.public_key.toBytes(),
-        frameFamilies(&.{ .control, .sync, .tsumugi }),
+        frameFamilies(&.{ .control, .sync, .mooring }),
     );
     try std.testing.expectEqualSlices(u8, &node.public_key.toBytes(), &fields.node_pubkey);
 }

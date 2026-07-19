@@ -5,24 +5,24 @@
 //! pipeline over the mesh's media bands (>=64).
 //!
 //!   negotiate()            -> agree codecs/FEC/direction via sdp offer/answer
-//!   Packetizer.packetize() -> kagura MediaFrame (seq/ts) -> wire bytes
+//!   Packetizer.packetize() -> cadence MediaFrame (seq/ts) -> wire bytes
 //!   Receiver.ingest()      -> decode -> reassembly reorder buffer
 //!   protectGeneration()    -> red_fec (ULPFEC) parity over a generation of frames
 //!   recoverFrame()         -> rebuild a single dropped frame from the FEC packet
 //!
 //! This is the media analog of `transport_stack.zig`: a thin coordinator wiring
-//! independently-tested modules (sdp, kagura_frame, red_fec) so a stream of
+//! independently-tested modules (sdp, cadence_frame, red_fec) so a stream of
 //! media frames survives reordering and single-packet loss end to end.
 const std = @import("std");
 
-const kagura = @import("kagura_frame.zig");
+const cadence = @import("cadence_frame.zig");
 const red_fec = @import("red_fec.zig");
 const sdp = @import("../proto/sdp.zig");
 const toml = @import("../proto/toml.zig");
 
-pub const MediaFrame = kagura.MediaFrame;
-pub const CodecTag = kagura.CodecTag;
-pub const PushResult = kagura.PushResult;
+pub const MediaFrame = cadence.MediaFrame;
+pub const CodecTag = cadence.CodecTag;
+pub const PushResult = cadence.PushResult;
 pub const MediaDescription = sdp.MediaDescription;
 
 /// Canonical Receiver wiring defaults.
@@ -50,7 +50,7 @@ pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
 
 /// Build the runtime `ReassemblyConfig` (reorder window) for a Receiver from
 /// `cfg`. The window must be <= the comptime `window` bound of the Receiver type.
-pub fn reassemblyConfig(cfg: Config) kagura.ReassemblyConfig {
+pub fn reassemblyConfig(cfg: Config) cadence.ReassemblyConfig {
     return .{ .window = cfg.reorder_window_frames };
 }
 
@@ -72,7 +72,7 @@ pub const Packetizer = struct {
     next_seq: u32 = 0,
 
     pub fn init(band_id: u8, stream_id: u32, codec: CodecTag) Packetizer {
-        std.debug.assert(kagura.isMediaBand(band_id));
+        std.debug.assert(cadence.isMediaBand(band_id));
         return .{ .band_id = band_id, .stream_id = stream_id, .codec = codec };
     }
 
@@ -91,24 +91,24 @@ pub const Packetizer = struct {
     }
 
     /// Encode the next frame's wire bytes into `out`; returns the byte length.
-    pub fn packetize(self: *Packetizer, payload: []const u8, keyframe: bool, timestamp: u64, out: []u8) kagura.EncodeError!usize {
-        return kagura.encode(self.frameFor(payload, keyframe, timestamp), out);
+    pub fn packetize(self: *Packetizer, payload: []const u8, keyframe: bool, timestamp: u64, out: []u8) cadence.EncodeError!usize {
+        return cadence.encode(self.frameFor(payload, keyframe, timestamp), out);
     }
 };
 
-/// Receiver-side reorder + in-order delivery over an kagura reassembly buffer.
+/// Receiver-side reorder + in-order delivery over an cadence reassembly buffer.
 pub fn Receiver(comptime max_payload: usize, comptime window: u32) type {
     return struct {
         const Self = @This();
-        reasm: kagura.ReassemblyBuffer(max_payload, window),
+        reasm: cadence.ReassemblyBuffer(max_payload, window),
 
-        pub fn init(cfg: kagura.ReassemblyConfig) Self {
-            return .{ .reasm = kagura.ReassemblyBuffer(max_payload, window).init(cfg) };
+        pub fn init(cfg: cadence.ReassemblyConfig) Self {
+            return .{ .reasm = cadence.ReassemblyBuffer(max_payload, window).init(cfg) };
         }
 
         /// Decode wire bytes and admit the frame to the reorder buffer.
-        pub fn ingest(self: *Self, frame_bytes: []const u8) kagura.DecodeError!PushResult {
-            const f = try kagura.decode(frame_bytes);
+        pub fn ingest(self: *Self, frame_bytes: []const u8) cadence.DecodeError!PushResult {
+            const f = try cadence.decode(frame_bytes);
             return self.reasm.push(f);
         }
 
@@ -186,12 +186,12 @@ const MEDIA_BAND: u8 = 64;
 test "negotiate intersects codecs and FEC via sdp" {
     const allocator = testing.allocator;
     const local_codecs = [_]sdp.Codec{
-        .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 },
+        .{ .tag = .cadencevox, .clock_rate = 48000, .params = 0 },
         .{ .tag = .raw, .clock_rate = 8000, .params = 0 },
     };
     const remote_codecs = [_]sdp.Codec{
         .{ .tag = .raw, .clock_rate = 8000, .params = 0 },
-        .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 },
+        .{ .tag = .cadencevox, .clock_rate = 48000, .params = 0 },
     };
     const local = MediaDescription{ .band_id = MEDIA_BAND, .kind = .audio, .codecs = &local_codecs, .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
     const remote = MediaDescription{ .band_id = MEDIA_BAND, .kind = .audio, .codecs = &remote_codecs, .fec = .{ .scheme = .rs_block, .redundancy = 1 }, .direction = .sendrecv };
@@ -202,7 +202,7 @@ test "negotiate intersects codecs and FEC via sdp" {
 }
 
 test "packetize -> reorder -> in-order delivery" {
-    var pk = Packetizer.init(MEDIA_BAND, 7, .kaguravox_audio);
+    var pk = Packetizer.init(MEDIA_BAND, 7, .cadencevox_audio);
     var rx = Receiver(256, 64).init(.{ .window = 16 });
 
     // Produce 4 frames, deliver them out of order (2,0,3,1).
@@ -225,7 +225,7 @@ test "packetize -> reorder -> in-order delivery" {
 
 test "FEC recovers a single dropped frame and delivery completes in order" {
     const allocator = testing.allocator;
-    var pk = Packetizer.init(MEDIA_BAND, 9, .kaguravox_audio);
+    var pk = Packetizer.init(MEDIA_BAND, 9, .cadencevox_audio);
     var rx = Receiver(256, 64).init(.{ .window = 16 });
 
     // Build a generation of 4 frames (kept for FEC), encode each to the wire.
@@ -235,7 +235,7 @@ test "FEC recovers a single dropped frame and delivery completes in order" {
     const payloads = [_][]const u8{ "gen-aaaa", "gen-bbbb", "gen-cccc", "gen-dddd" };
     for (0..4) |i| {
         frames[i] = pk.frameFor(payloads[i], false, @intCast(i * 960));
-        lens[i] = try kagura.encode(frames[i], &wire[i]);
+        lens[i] = try cadence.encode(frames[i], &wire[i]);
     }
 
     var fec_buf: [256]u8 = undefined;
@@ -289,7 +289,7 @@ test "applyToml overlays media keys and drives a Receiver window" {
     // Comptime bounds must cover the configured runtime window; the runtime
     // window is taken from config.
     var rx = Receiver(256, 64).init(reassemblyConfig(cfg));
-    var pk = Packetizer.init(MEDIA_BAND, 1, .kaguravox_audio);
+    var pk = Packetizer.init(MEDIA_BAND, 1, .cadencevox_audio);
     var wire: [64]u8 = undefined;
     const len = try pk.packetize("hi", true, 0, &wire);
     try testing.expectEqual(PushResult.buffered, try rx.ingest(wire[0..len]));

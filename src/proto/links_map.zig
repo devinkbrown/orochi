@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Suimyaku mesh-native LINKS and MAP numeric builders.
+//! Undertow mesh-native LINKS and MAP numeric builders.
 //!
 //! These replies keep the familiar IRC numeric surface while reporting the
 //! current CRDT mesh snapshot. `hops` is distance from the local node, and
@@ -45,7 +45,7 @@ pub const Params = struct {
     max_line_bytes: usize = DEFAULT_MAX_LINE_BYTES,
 };
 
-/// One Suimyaku mesh node visible to LINKS/MAP.
+/// One Undertow mesh node visible to LINKS/MAP.
 pub const MeshNode = struct {
     name: []const u8,
     hops: u16,
@@ -77,7 +77,7 @@ pub fn writeLinksNodeWith(
     var b = LineBuilder.init(out, params.max_line_bytes);
     try b.numericPrefix(.RPL_LINKS, ctx.server_name, ctx.requester);
     try b.spaceBytes(node.name);
-    try b.spaceBytes("suimyaku");
+    try b.spaceBytes("undertow");
     try b.appendBytes(" :");
     try b.appendUnsigned(node.hops);
     try b.appendBytes(" hops ");
@@ -107,7 +107,7 @@ pub fn writeLinksEndWith(
     var b = LineBuilder.init(out, params.max_line_bytes);
     try b.numericPrefix(.RPL_ENDOFLINKS, ctx.server_name, ctx.requester);
     try b.spaceBytes("*");
-    try b.spaceTrailing("End of Suimyaku LINKS");
+    try b.spaceTrailing("End of Undertow LINKS");
     try b.crlf();
     return b.slice();
 }
@@ -202,7 +202,7 @@ pub fn writeMapEndWith(
 
     var b = LineBuilder.init(out, params.max_line_bytes);
     try b.numericPrefix(.RPL_MAPEND, ctx.server_name, ctx.requester);
-    try b.spaceTrailing("End of Suimyaku MAP");
+    try b.spaceTrailing("End of Undertow MAP");
     try b.crlf();
     return b.slice();
 }
@@ -432,11 +432,11 @@ test "single-node mesh emits just us for LINKS and MAP" {
 
     try std.testing.expectEqual(@as(usize, 2), sink.slice().len);
     try std.testing.expectEqualStrings(
-        ":irc.local 364 alice irc.local suimyaku :0 hops 0 peers local mesh node\r\n",
+        ":irc.local 364 alice irc.local undertow :0 hops 0 peers local mesh node\r\n",
         sink.slice()[0],
     );
     try std.testing.expectEqualStrings(
-        ":irc.local 365 alice * :End of Suimyaku LINKS\r\n",
+        ":irc.local 365 alice * :End of Undertow LINKS\r\n",
         sink.slice()[1],
     );
 
@@ -446,7 +446,7 @@ test "single-node mesh emits just us for LINKS and MAP" {
         map_sink.slice()[0],
     );
     try std.testing.expectEqualStrings(
-        ":irc.local 017 alice :End of Suimyaku MAP\r\n",
+        ":irc.local 017 alice :End of Undertow MAP\r\n",
         map_sink.slice()[1],
     );
 }
@@ -466,7 +466,7 @@ test "multi-node mesh renders peer metadata and hop indentation" {
 
     try std.testing.expectEqual(@as(usize, 4), links_sink.slice().len);
     try std.testing.expectEqualStrings(
-        ":irc.local 364 alice edge-a suimyaku :1 hops 3 peers regional edge\r\n",
+        ":irc.local 364 alice edge-a undertow :1 hops 3 peers regional edge\r\n",
         links_sink.slice()[1],
     );
 

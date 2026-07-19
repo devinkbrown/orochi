@@ -1,4 +1,4 @@
-# Yoroi TLS 1.3 feature audit — RFC 8446 (+ 8446bis where stable)
+# Armor TLS 1.3 feature audit — RFC 8446 (+ 8446bis where stable)
 
 Date: 2026-07-11. Scope: the TLS **1.3** core only — `src/crypto/tls_server.zig`,
 `src/crypto/tls_client.zig`, `src/crypto/tls_record.zig`, `src/crypto/hkdf_tls13.zig`,

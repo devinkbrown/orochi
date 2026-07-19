@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `yoroi x509` — certificate display and conversion, openssl-x509 parity
-//! backed entirely by the Yoroi substrate: parsing via src/crypto/x509.zig
+//! `armor x509` — certificate display and conversion, openssl-x509 parity
+//! backed entirely by the Armor substrate: parsing via src/crypto/x509.zig
 //! (`x509.parse`, `DerReader`), fingerprints via the parsed cert's SHA-256
 //! helpers. The only logic added here is display formatting (RDN walk of the
 //! issuer/subject Name TLVs); no crypto is reimplemented.
@@ -29,7 +29,7 @@ pub const Options = struct {
 
 pub fn usage(w: *Writer) Writer.Error!void {
     try w.writeAll(
-        \\usage: yoroi x509 [-in <path>] [options]
+        \\usage: armor x509 [-in <path>] [options]
         \\  -in <path>        input certificate (PEM or DER; default stdin)
         \\  -inform pem|der   force the input encoding (default: auto-detect)
         \\  -text             print a human-readable dump of the certificate
@@ -267,17 +267,17 @@ const ecdsa_p256 = orochi.crypto.ecdsa_p256;
 fn fixtureCert(out: []u8) ![]const u8 {
     const kp = ecdsa_p256.KeyPair.generate(std.testing.io);
     return x509_selfsign.buildSelfSignedEcdsaP256(out, .{
-        .common_name = "yoroicli.test",
+        .common_name = "armorcli.test",
         .not_before = 1_700_000_000,
         .not_after = 1_900_000_000,
         .serial = &.{ 0x01, 0x02, 0x03 },
         .key_pair = kp,
-        .dns_names = &.{ "yoroicli.test", "alt.yoroicli.test" },
+        .dns_names = &.{ "armorcli.test", "alt.armorcli.test" },
         .is_ca = true,
     });
 }
 
-test "yoroicli x509 -text dumps subject, SAN, validity, and key type" {
+test "armorcli x509 -text dumps subject, SAN, validity, and key type" {
     const gpa = testing.allocator;
     var der_buf: [2048]u8 = undefined;
     const der = try fixtureCert(&der_buf);
@@ -287,9 +287,9 @@ test "yoroicli x509 -text dumps subject, SAN, validity, and key type" {
     try runOnDer(gpa, std.testing.io, .{ .text = true, .noout = true }, der, &aw.writer);
     const got = aw.written();
 
-    try testing.expect(std.mem.indexOf(u8, got, "Subject: CN=yoroicli.test") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "Issuer: CN=yoroicli.test") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "DNS:alt.yoroicli.test") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "Subject: CN=armorcli.test") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "Issuer: CN=armorcli.test") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "DNS:alt.armorcli.test") != null);
     try testing.expect(std.mem.indexOf(u8, got, "ECDSA P-256") != null);
     try testing.expect(std.mem.indexOf(u8, got, "Serial Number: 01:02:03") != null);
     try testing.expect(std.mem.indexOf(u8, got, "Basic Constraints: CA=true") != null);
@@ -298,7 +298,7 @@ test "yoroicli x509 -text dumps subject, SAN, validity, and key type" {
     try testing.expect(std.mem.indexOf(u8, got, "-----BEGIN CERTIFICATE-----") == null);
 }
 
-test "yoroicli x509 -fingerprint matches the substrate certfp" {
+test "armorcli x509 -fingerprint matches the substrate certfp" {
     const gpa = testing.allocator;
     var der_buf: [2048]u8 = undefined;
     const der = try fixtureCert(&der_buf);
@@ -314,7 +314,7 @@ test "yoroicli x509 -fingerprint matches the substrate certfp" {
     try testing.expect(std.mem.indexOf(u8, aw.written(), expect_hex.written()) != null);
 }
 
-test "yoroicli x509 PEM<->DER round-trips byte-identically" {
+test "armorcli x509 PEM<->DER round-trips byte-identically" {
     const gpa = testing.allocator;
     var der_buf: [2048]u8 = undefined;
     const der = try fixtureCert(&der_buf);
@@ -337,7 +337,7 @@ test "yoroicli x509 PEM<->DER round-trips byte-identically" {
     try testing.expectEqualSlices(u8, der, der_out.written());
 }
 
-test "yoroicli x509 rejects truncated DER with a typed error, no crash" {
+test "armorcli x509 rejects truncated DER with a typed error, no crash" {
     const gpa = testing.allocator;
     var der_buf: [2048]u8 = undefined;
     const der = try fixtureCert(&der_buf);
@@ -352,7 +352,7 @@ test "yoroicli x509 rejects truncated DER with a typed error, no crash" {
     }
 }
 
-test "yoroicli x509 parseArgs rejects unknown flags and missing values" {
+test "armorcli x509 parseArgs rejects unknown flags and missing values" {
     try testing.expectError(error.Usage, parseArgs(&.{"-bogus"}));
     try testing.expectError(error.Usage, parseArgs(&.{"-in"}));
     try testing.expectError(error.Usage, parseArgs(&.{ "-inform", "txt" }));

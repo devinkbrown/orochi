@@ -1,8 +1,8 @@
 # Mesh and S2S
 
-*Configure server-to-server linking over the [Suimyaku](../reference/glossary.md) mesh, including secured and plaintext links and operator inspection views.*
+*Configure server-to-server linking over the [Undertow](../reference/glossary.md) mesh, including secured and plaintext links and operator inspection views.*
 
-Orochi server-to-server (S2S) linking runs on the [Suimyaku](../reference/glossary.md) mesh runtime. Configure node identity in `[node]`, mesh settings in `[mesh]`, and the inbound S2S listener in `[listen].s2s`.
+Orochi server-to-server (S2S) linking runs on the [Undertow](../reference/glossary.md) mesh runtime. Configure node identity in `[node]`, mesh settings in `[mesh]`, and the inbound S2S listener in `[listen].s2s`.
 
 ```toml
 [node]
@@ -133,7 +133,7 @@ The operator security module exposes the current mesh inspection commands (`src/
 |---|---|
 | `MESH` or `NETSTAT` | Direct S2S peer/link health, multi-hop reachability, partition summary, `MESH LOG`, `MESH ADMISSION`, and `MESH GRANTS` (`src/daemon/server.zig:28746`, `src/daemon/server.zig:28748`, `src/daemon/server.zig:28761`, `src/daemon/server.zig:28780`, `src/daemon/server.zig:28835`). |
 | `ROUTE` | Current routing view: local node plus established one-hop peers; multi-hop routing is noted as future substrate work (`src/daemon/server.zig:28909`, `src/daemon/server.zig:28918`). |
-| `NETHEALTH` | [Sazanami](../reference/glossary.md)-style liveness view using local node, established peers, RTT, idle time, and the live quorum/component summary (`src/daemon/server.zig:28931`, `src/daemon/server.zig:28943`, `src/daemon/server.zig:28961`). |
+| `NETHEALTH` | [Ripple](../reference/glossary.md)-style liveness view using local node, established peers, RTT, idle time, and the live quorum/component summary (`src/daemon/server.zig:28931`, `src/daemon/server.zig:28943`, `src/daemon/server.zig:28961`). |
 | `CONNECT` | Opens outbound S2S to a peer (`src/daemon/server.zig:17161`, `src/daemon/server.zig:17180`). |
 | `SQUIT` | Tears down an S2S link by server name (`src/daemon/server.zig:17312`, `src/daemon/server.zig:17322`). |
 

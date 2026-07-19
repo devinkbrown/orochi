@@ -16,7 +16,7 @@
 
 const std = @import("std");
 
-const message_relay_v2 = @import("../substrate/suimyaku/message_relay_v2.zig");
+const message_relay_v2 = @import("../substrate/undertow/message_relay_v2.zig");
 
 pub const PublicKey = [message_relay_v2.pubkey_len]u8;
 pub const RelayId = message_relay_v2.RelayId;
@@ -554,7 +554,7 @@ fn writeU64(bytes: *[8]u8, value: u64) void {
 
 const testing = std.testing;
 const sign = @import("../crypto/sign.zig");
-const signed_frame = @import("../substrate/suimyaku/signed_frame.zig");
+const signed_frame = @import("../substrate/undertow/signed_frame.zig");
 
 fn testKey(byte: u8) PublicKey {
     return @splat(byte);

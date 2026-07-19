@@ -189,12 +189,12 @@ propagated so oper **admins** get the same view they have for local users
 - **Gating** — these fields are SENSITIVE, so they ride **only the secured leg**.
   `s2s_peer` advertises `cap_member_oper_info` **only when it holds a node
   signing key** — the same secured-link indicator as frame signing
-  ([src/substrate/suimyaku/s2s_peer.zig](../../src/substrate/suimyaku/s2s_peer.zig),
+  ([src/substrate/undertow/s2s_peer.zig](../../src/substrate/undertow/s2s_peer.zig),
   `caps |= cap_frame_signing | cap_member_oper_info`). `sendMembership` emits the
   fields only to a peer that negotiated the cap, else empty — a plaintext leg
   never carries them.
 - **Storage** — `route_table` `MemberIdentity`/`Member` own `real_host`/`certfp`
-  ([src/substrate/suimyaku/route_table.zig](../../src/substrate/suimyaku/route_table.zig)),
+  ([src/substrate/undertow/route_table.zig](../../src/substrate/undertow/route_table.zig)),
   duped on create and `replaceOwned` on LWW update; `recvMembership` threads the
   decoded fields into `applyMembership`.
 - **Display** — `sendRemoteWhois` reveals the real IP (338), GeoIP/ASN (320,

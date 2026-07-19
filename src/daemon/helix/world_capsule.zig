@@ -280,7 +280,7 @@ test "round-trip with non-null key, members, and topic" {
     const original = WorldCapsule{
         .name = "#orochi",
         .topic = "Welcome to the deep",
-        .topic_setter = "Suimyaku!user@host",
+        .topic_setter = "Undertow!user@host",
         .topic_ts = 1_700_000_000,
         .created_unix = 1_600_000_000,
         .oid = 0xDEAD_BEEF_CAFE_F00D,

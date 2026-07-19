@@ -14,8 +14,8 @@ const std = @import("std");
 const attachment_id_mod = @import("../attachment_id.zig");
 const sign = @import("../../crypto/sign.zig");
 const session_portability = @import("../../proto/session_portability.zig");
-const mesh_clock = @import("../../substrate/suimyaku/mesh_clock.zig");
-const signed_frame = @import("../../substrate/suimyaku/signed_frame.zig");
+const mesh_clock = @import("../../substrate/undertow/mesh_clock.zig");
+const signed_frame = @import("../../substrate/undertow/signed_frame.zig");
 
 pub const Token = attachment_id_mod.SessionToken;
 pub const AttachmentId = attachment_id_mod.AttachmentId;

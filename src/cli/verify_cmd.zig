@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `yoroi verify` — certificate-chain verification against a CA bundle.
+//! `armor verify` — certificate-chain verification against a CA bundle.
 //!
 //! All trust decisions are substrate calls: chain signature + validity +
 //! CA/pathlen/name-constraint enforcement via src/crypto/x509_verify.zig
@@ -37,7 +37,7 @@ pub const Options = struct {
 
 pub fn usage(w: *Writer) Writer.Error!void {
     try w.writeAll(
-        \\usage: yoroi verify -CAfile <bundle> [-name <dns>] [cert]
+        \\usage: armor verify -CAfile <bundle> [-name <dns>] [cert]
         \\  -CAfile <path>  PEM bundle of trust anchors (required)
         \\  -name <dns>     require the leaf SAN to match this DNS name
         \\  -at <epoch>     verify at this Unix time (default: now)
@@ -187,7 +187,7 @@ const testing = std.testing;
 const x509_selfsign = orochi.proto.x509_selfsign;
 const ecdsa_p256 = orochi.crypto.ecdsa_p256;
 
-test "yoroicli verify accepts a root-issued leaf and rejects a stranger" {
+test "armorcli verify accepts a root-issued leaf and rejects a stranger" {
     const gpa = testing.allocator;
     const io = std.testing.io;
     const now: i64 = 1_800_000_000;
@@ -196,7 +196,7 @@ test "yoroicli verify accepts a root-issued leaf and rejects a stranger" {
     const ca_kp = ecdsa_p256.KeyPair.generate(io);
     var ca_buf: [2048]u8 = undefined;
     const ca_der = try x509_selfsign.buildSelfSignedEcdsaP256(&ca_buf, .{
-        .common_name = "yoroicli root",
+        .common_name = "armorcli root",
         .not_before = now - 1000,
         .not_after = now + 100_000,
         .serial = &.{0x01},
@@ -210,7 +210,7 @@ test "yoroicli verify accepts a root-issued leaf and rejects a stranger" {
     // builder limitation, x509_selfsign.zig:271), so the leaf CN must equal
     // the CA subject for DN linkage. Naming lives in the SAN anyway (RFC 6125).
     const leaf_der = try x509_selfsign.buildEcdsaP256IssuedBy(&leaf_buf, .{
-        .common_name = "yoroicli root",
+        .common_name = "armorcli root",
         .not_before = now - 1000,
         .not_after = now + 100_000,
         .serial = &.{0x02},
@@ -243,7 +243,7 @@ test "yoroicli verify accepts a root-issued leaf and rejects a stranger" {
     try testing.expectError(error.NameMismatch, verifyChain(gpa, &.{leaf_der}, &.{ca_der}, now, "evil.test"));
 }
 
-test "yoroicli verify dnsPatternMatches is single-label only" {
+test "armorcli verify dnsPatternMatches is single-label only" {
     try testing.expect(dnsPatternMatches("leaf.test", "LEAF.test"));
     try testing.expect(dnsPatternMatches("*.example.com", "www.example.com"));
     try testing.expect(!dnsPatternMatches("*.example.com", "a.b.example.com"));
@@ -253,7 +253,7 @@ test "yoroicli verify dnsPatternMatches is single-label only" {
     try testing.expect(!dnsPatternMatches("*.", "a."));
 }
 
-test "yoroicli verify decodeChain handles multi-block PEM and garbage" {
+test "armorcli verify decodeChain handles multi-block PEM and garbage" {
     const gpa = testing.allocator;
     const io = std.testing.io;
     const kp = ecdsa_p256.KeyPair.generate(io);
@@ -285,7 +285,7 @@ test "yoroicli verify decodeChain handles multi-block PEM and garbage" {
     try testing.expectError(error.BeginNotFound, decodeChain(gpa, "no pem here", &g_chain, &g_count));
 }
 
-test "yoroicli verify arg parsing requires -CAfile" {
+test "armorcli verify arg parsing requires -CAfile" {
     try testing.expectError(error.Usage, parseArgs(&.{"cert.pem"}));
     const opts = try parseArgs(&.{ "-CAfile", "ca.pem", "-name", "x.test", "cert.pem" });
     try testing.expectEqualStrings("ca.pem", opts.ca_file);

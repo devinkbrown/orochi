@@ -5,15 +5,17 @@ database server to run, no OpenSSL to patch, no runtime to install — it ships
 its own TLS 1.3 stack, its own mesh, and its own services. This directory holds
 everything to run it and to prove the binary you run is the one from source.
 
-## 60-second quickstart (native)
+## Quickstart (native)
 
 ```sh
-# 1. Get the binary (build it — see "Reproducible releases" — or download a release).
+# 1. Build the binary (see "Reproducible releases" below — a few minutes on a
+#    fresh clone; there is no pre-built release to download yet).
+packaging/release.sh
 # 2. Run a single self-hosted node with the zero-config quickstart:
-./orochi packaging/orochi.quickstart.toml
+./dist/orochi-*-x86_64-linux-musl packaging/orochi.quickstart.toml
 ```
 
-That boots a working node:
+That boots a working node in well under a second:
 
 - **`ws://localhost:8080`** — the browser WebSocket endpoint for the Onyx web client.
 - **`irc://localhost:6667`** — plaintext IRC for any IRC client.
@@ -23,7 +25,7 @@ The node's **sovereign identity key** (`orochi-node.key`) and the account store
 configure. For production, replace the quickstart config with a TLS config (real
 certs or the built-in ACME client) and set `ws_plain = false`.
 
-## 60-second quickstart (Docker)
+## Quickstart (Docker)
 
 ```sh
 packaging/release.sh                                   # build the verified static binary → dist/

@@ -60,10 +60,10 @@ pub fn renderInfo(info: AboutInfo, writer: anytype) !void {
 
     try writer.writeAll("100% Zig, zero C interop - substrate, crypto, and daemon are all native.\n");
     try writer.writeAll("\n");
-    try writer.writeAll("Mesh:     Suimyaku CRDT world state | Sazanami gossip | Goryu membership\n");
-    try writer.writeAll("Security: Tsumugi PQ-hybrid handshake | MeshPass admission | zeroize-on-free key hygiene\n");
-    try writer.writeAll("Crypto:   Yoroi - a from-scratch pure-Zig TLS and primitive library\n");
-    try writer.writeAll("Media:    Kakehashi SFU | KaguraVox/KaguraVis codecs | QUIC/WebTransport transport\n");
+    try writer.writeAll("Mesh:     Undertow CRDT world state | Ripple gossip | Concord membership\n");
+    try writer.writeAll("Security: Mooring PQ-hybrid handshake | MeshPass admission | zeroize-on-free key hygiene\n");
+    try writer.writeAll("Crypto:   Armor - a from-scratch pure-Zig TLS and primitive library\n");
+    try writer.writeAll("Media:    Causeway SFU | CadenceVox/CadenceVis codecs | QUIC/WebTransport transport\n");
     try writer.writeAll("History:  Lotus event-DAG with verified-streaming backfill\n");
     try writer.writeAll("\n");
 
@@ -125,7 +125,7 @@ test "renderInfo includes identity, build, and uptime" {
     }, &buf);
 
     try std.testing.expect(std.mem.indexOf(u8, out, "Version orochi-0.1 (zig 0.16.0, x86_64-linux, ReleaseFast)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Suimyaku CRDT") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Undertow CRDT") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Network:  Orochi") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "Running since 1700000000 (up 1h 01m 01s)") != null);
     // Every line is non-empty-terminated by '\n'; never a bare CR.

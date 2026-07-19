@@ -2073,7 +2073,7 @@ pub const Client = struct {
                 // Server share = ml-kem_ct(1088) || x25519_pub(32). The combined
                 // (EC)DHE secret is the RAW concatenation ml-kem_ss(32) || x25519_ss(32)
                 // fed to the TLS key schedule — matching tls_server. (NOT
-                // kx.HybridKx.decapsulate, which is the TSUMUGI mesh HKDF combiner.)
+                // kx.HybridKx.decapsulate, which is the MOORING mesh HKDF combiner.)
                 const ct_len = kx.HybridKx.mlkem_ciphertext_len;
                 if (share.key_exchange.len != ct_len + kx.X25519Kx.public_len) return error.BadHandshake;
                 var ct: [ct_len]u8 = undefined;

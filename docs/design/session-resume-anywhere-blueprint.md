@@ -106,7 +106,7 @@ preservation state.
 - Only a session for which an MTOKEN was issued is replicated.
 - MTOKEN issuance offers the live snapshot immediately; waiting for detach would make
   simultaneous cross-node attachment impossible.
-- Snapshot offers are Ed25519-signed and travel only over Tsumugi-authenticated S2S
+- Snapshot offers are Ed25519-signed and travel only over Mooring-authenticated S2S
   links. The receiver pins the signer to the authenticated peer key and verifies the
   inner and outer account binding before staging.
 - Offers use a strictly increasing, token-scoped epoch. Replayed or reordered offers

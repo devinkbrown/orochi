@@ -1,6 +1,6 @@
 # Cryptography and secure-channel architecture
 
-*The cryptography implemented in the current Orochi source tree: primitives, TLS, the Tsumugi AKE, and the signed-object formats that protect mesh traffic.*
+*The cryptography implemented in the current Orochi source tree: primitives, TLS, the Mooring AKE, and the signed-object formats that protect mesh traffic.*
 
 This document describes the cryptography that exists in the current Orochi
 source tree. Every behavioral claim is cited to `src/`.
@@ -50,8 +50,8 @@ implemented.
 | Surface | Implemented primitive / format | Source evidence |
 | --- | --- | --- |
 | X-Wing KEM | ML-KEM-768 + X25519 hybrid KEM; public key is ML-KEM-768 public key plus X25519 public key; ciphertext is ML-KEM-768 ciphertext plus X25519 ephemeral public key; shared secret is SHA3-256 over `ss_M || ss_X || ct_X || pk_X || XWingLabel`. | `src/crypto/xwing.zig:1`, `src/crypto/xwing.zig:5`, `src/crypto/xwing.zig:6`, `src/crypto/xwing.zig:7`, `src/crypto/xwing.zig:129`, `src/crypto/xwing.zig:135` |
-| Ed25519 identity and signatures | Tsumugi node identity and signed prekeys use the local Ed25519 signing key; `SignedPrekey` embeds the node key and Ed25519 signature. | `src/crypto/tsumugi_handshake.zig:99`, `src/crypto/tsumugi_handshake.zig:101`, `src/crypto/tsumugi_handshake.zig:110`, `src/crypto/tsumugi_handshake.zig:136`, `src/crypto/tsumugi_handshake.zig:137` |
-| Tsumugi handshake payload AEAD | Handshake payloads are sealed/opened with ChaCha20-Poly1305. Keys are derived with HKDF-SHA256 over the X-Wing secret and a BLAKE3 salt over label/AAD. | `src/crypto/tsumugi_handshake.zig:17`, `src/crypto/tsumugi_handshake.zig:18`, `src/crypto/tsumugi_handshake.zig:467`, `src/crypto/tsumugi_handshake.zig:473`, `src/crypto/tsumugi_handshake.zig:474`, `src/crypto/tsumugi_handshake.zig:489`, `src/crypto/tsumugi_handshake.zig:495` |
+| Ed25519 identity and signatures | Mooring node identity and signed prekeys use the local Ed25519 signing key; `SignedPrekey` embeds the node key and Ed25519 signature. | `src/crypto/mooring_handshake.zig:99`, `src/crypto/mooring_handshake.zig:101`, `src/crypto/mooring_handshake.zig:110`, `src/crypto/mooring_handshake.zig:136`, `src/crypto/mooring_handshake.zig:137` |
+| Mooring handshake payload AEAD | Handshake payloads are sealed/opened with ChaCha20-Poly1305. Keys are derived with HKDF-SHA256 over the X-Wing secret and a BLAKE3 salt over label/AAD. | `src/crypto/mooring_handshake.zig:17`, `src/crypto/mooring_handshake.zig:18`, `src/crypto/mooring_handshake.zig:467`, `src/crypto/mooring_handshake.zig:473`, `src/crypto/mooring_handshake.zig:474`, `src/crypto/mooring_handshake.zig:489`, `src/crypto/mooring_handshake.zig:495` |
 | TLS listener AEADs | TLS 1.3 server supports `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, and `TLS_CHACHA20_POLY1305_SHA256`; TLS 1.2 policy allows only ECDHE AEAD suites. | `src/crypto/tls_server.zig:361`, `src/crypto/tls_server.zig:363`, `src/crypto/tls_server.zig:407`, `src/crypto/tls_server.zig:411`, `src/crypto/tls.zig:173`, `src/crypto/tls.zig:207` |
 | Secret(T) | Fixed-size and runtime-length byte-secret wrappers require explicit `expose`/`declassify`, compare without data-dependent early exit, format as redacted, and wipe wrapped bytes. Compile-time checks reject non-byte wrappers or non-mutable storage for wipe. | `src/crypto/secret.zig:4`, `src/crypto/secret.zig:9`, `src/crypto/secret.zig:27`, `src/crypto/secret.zig:42`, `src/crypto/secret.zig:44`, `src/crypto/secret.zig:63`, `src/crypto/secret.zig:67`, `src/crypto/secret.zig:89`, `src/crypto/secret.zig:100`, `src/crypto/secret.zig:129` |
 | HPKE | Base mode DHKEM(X25519, HKDF-SHA256), HKDF-SHA256, ChaCha20-Poly1305. | `src/crypto/hpke.zig:1`, `src/crypto/hpke.zig:9`, `src/crypto/hpke.zig:10`, `src/crypto/hpke.zig:11`, `src/crypto/hpke.zig:14`, `src/crypto/hpke.zig:15`, `src/crypto/hpke.zig:16` |
@@ -136,7 +136,7 @@ mesh key keep unsigned audit and event lines.
 
 ## Node identity
 
-`src/daemon/node_identity.zig` derives all live Tsumugi identity material from
+`src/daemon/node_identity.zig` derives all live Mooring identity material from
 the configured `node.secret_key` and `mesh.realm`. The sovereign seed is a
 32-byte Ed25519 seed supplied as 64 hex chars; `fromConfig` rejects other sizes
 or invalid hex (`src/daemon/node_identity.zig:90`,
@@ -158,11 +158,11 @@ to one because zero is an unknown-peer sentinel (`src/crypto/node_short_id.zig:1
 `src/crypto/node_short_id.zig:3`, `src/crypto/node_short_id.zig:10`,
 `src/crypto/node_short_id.zig:24`, `src/crypto/node_short_id.zig:30`,
 `src/crypto/node_short_id.zig:36`, `src/crypto/node_short_id.zig:37`).
-`tsumugi_session.Session` captures both identities on establishment:
+`mooring_session.Session` captures both identities on establishment:
 `peerNodeId()` returns the authenticated 20-byte id, `peerNodeKey()` returns the
 authenticated Ed25519 public key, and `peerShortId()` returns the u64 routing
-handle (`src/crypto/tsumugi_session.zig:120`,
-`src/crypto/tsumugi_session.zig:129`, `src/crypto/tsumugi_session.zig:140`).
+handle (`src/crypto/mooring_session.zig:120`,
+`src/crypto/mooring_session.zig:129`, `src/crypto/mooring_session.zig:140`).
 
 At boot, a configured `node.secret_key` enables PQ-secured S2S by deriving this
 identity; without it, S2S stays plaintext for compatibility
@@ -170,50 +170,50 @@ identity; without it, S2S stays plaintext for compatibility
 `src/main.zig:145`, `src/main.zig:146`, `src/main.zig:148`,
 `src/main.zig:150`, `src/main.zig:152`).
 
-## Tsumugi PQ-hybrid S2S handshake
+## Mooring PQ-hybrid S2S handshake
 
-The Tsumugi handshake is implemented in `src/crypto/tsumugi_handshake.zig` and
-wrapped by `src/crypto/tsumugi_session.zig`. The module comment describes it as
+The Mooring handshake is implemented in `src/crypto/mooring_handshake.zig` and
+wrapped by `src/crypto/mooring_session.zig`. The module comment describes it as
 a compact Noise-IK-shaped AKE: Ed25519 is the static node identity, X-Wing
 transport prekeys provide hybrid KEM entropy, and the initiator node id plus
 MeshPass bytes appear only inside encrypted M1
-(`src/crypto/tsumugi_handshake.zig:1`, `src/crypto/tsumugi_handshake.zig:3`,
-`src/crypto/tsumugi_handshake.zig:4`, `src/crypto/tsumugi_handshake.zig:5`,
-`src/crypto/tsumugi_handshake.zig:6`).
+(`src/crypto/mooring_handshake.zig:1`, `src/crypto/mooring_handshake.zig:3`,
+`src/crypto/mooring_handshake.zig:4`, `src/crypto/mooring_handshake.zig:5`,
+`src/crypto/mooring_handshake.zig:6`).
 
 ### Wire constants and limits
 
 | Item | Value / behavior | Source |
 | --- | --- | --- |
-| Magic | `MZTH` | `src/crypto/tsumugi_handshake.zig:44` |
-| Message types | M1 = 1, M2 = 2 | `src/crypto/tsumugi_handshake.zig:45`, `src/crypto/tsumugi_handshake.zig:46` |
-| Protocol version | 1 | `src/crypto/tsumugi_handshake.zig:26` |
-| M1/M2 payload schemas | `0x3002`, `0x3003` | `src/crypto/tsumugi_handshake.zig:47`, `src/crypto/tsumugi_handshake.zig:48` |
-| Signature domains | `tsumugi-prekey-v1`, `tsumugi-m1-v1`, `tsumugi-m2-v1` | `src/crypto/tsumugi_handshake.zig:49`, `src/crypto/tsumugi_handshake.zig:50`, `src/crypto/tsumugi_handshake.zig:51` |
-| MeshPass byte cap | default 4096, configurable as `[tls].tsumugi_max_meshpass_len`; zero/absent leaves the cap unchanged. | `src/crypto/tsumugi_handshake.zig:28`, `src/crypto/tsumugi_handshake.zig:29`, `src/crypto/tsumugi_handshake.zig:31`, `src/crypto/tsumugi_handshake.zig:36`, `src/crypto/tsumugi_handshake.zig:39`, `src/crypto/tsumugi_handshake.zig:40` |
+| Magic | `MZTH` | `src/crypto/mooring_handshake.zig:48` |
+| Message types | M1 = 1, M2 = 2 | `src/crypto/mooring_handshake.zig:49`, `src/crypto/mooring_handshake.zig:50` |
+| Protocol version | 1 | `src/crypto/mooring_handshake.zig:30` |
+| M1/M2 payload schemas | `0x3002`, `0x3003` | `src/crypto/mooring_handshake.zig:51`, `src/crypto/mooring_handshake.zig:52` |
+| Signature domains | `tsumugi-prekey-v1`, `tsumugi-m1-v1`, `tsumugi-m2-v1` | `src/crypto/mooring_handshake.zig:53`, `src/crypto/mooring_handshake.zig:54`, `src/crypto/mooring_handshake.zig:55` |
+| MeshPass byte cap | default 4096, configurable as `[tls].tsumugi_max_meshpass_len`; zero/absent leaves the cap unchanged. | `src/crypto/mooring_handshake.zig:33`, `src/crypto/mooring_handshake.zig:38`, `src/crypto/mooring_handshake.zig:40`, `src/crypto/mooring_handshake.zig:42`, `src/crypto/mooring_handshake.zig:43`, `src/crypto/mooring_handshake.zig:44` |
 
 ### SignedPrekey
 
 `SignedPrekey` contains the realm, Ed25519 node key, 20-byte node id, prekey id,
 X-Wing public key, validity window, usage bits, supported bands/features, and
-signature (`src/crypto/tsumugi_handshake.zig:99`,
-`src/crypto/tsumugi_handshake.zig:100`, `src/crypto/tsumugi_handshake.zig:101`,
-`src/crypto/tsumugi_handshake.zig:102`, `src/crypto/tsumugi_handshake.zig:103`,
-`src/crypto/tsumugi_handshake.zig:104`, `src/crypto/tsumugi_handshake.zig:105`,
-`src/crypto/tsumugi_handshake.zig:106`, `src/crypto/tsumugi_handshake.zig:107`,
-`src/crypto/tsumugi_handshake.zig:108`, `src/crypto/tsumugi_handshake.zig:109`,
-`src/crypto/tsumugi_handshake.zig:110`). Creation computes the node id from the
+signature (`src/crypto/mooring_handshake.zig:99`,
+`src/crypto/mooring_handshake.zig:100`, `src/crypto/mooring_handshake.zig:101`,
+`src/crypto/mooring_handshake.zig:102`, `src/crypto/mooring_handshake.zig:103`,
+`src/crypto/mooring_handshake.zig:104`, `src/crypto/mooring_handshake.zig:105`,
+`src/crypto/mooring_handshake.zig:106`, `src/crypto/mooring_handshake.zig:107`,
+`src/crypto/mooring_handshake.zig:108`, `src/crypto/mooring_handshake.zig:109`,
+`src/crypto/mooring_handshake.zig:110`). Creation computes the node id from the
 Ed25519 public key, hashes all prekey fields with BLAKE3 domain
 `MZ-TSUMUGI-PREKEY-v1`, and signs that digest in the prekey domain
-(`src/crypto/tsumugi_handshake.zig:126`,
-`src/crypto/tsumugi_handshake.zig:136`, `src/crypto/tsumugi_handshake.zig:137`,
-`src/crypto/tsumugi_handshake.zig:383`, `src/crypto/tsumugi_handshake.zig:385`,
-`src/crypto/tsumugi_handshake.zig:386`, `src/crypto/tsumugi_handshake.zig:390`,
-`src/crypto/tsumugi_handshake.zig:394`, `src/crypto/tsumugi_handshake.zig:395`).
+(`src/crypto/mooring_handshake.zig:126`,
+`src/crypto/mooring_handshake.zig:136`, `src/crypto/mooring_handshake.zig:137`,
+`src/crypto/mooring_handshake.zig:383`, `src/crypto/mooring_handshake.zig:385`,
+`src/crypto/mooring_handshake.zig:386`, `src/crypto/mooring_handshake.zig:390`,
+`src/crypto/mooring_handshake.zig:394`, `src/crypto/mooring_handshake.zig:395`).
 Verification checks node-id consistency, the validity window, and the Ed25519
-signature (`src/crypto/tsumugi_handshake.zig:141`,
-`src/crypto/tsumugi_handshake.zig:142`, `src/crypto/tsumugi_handshake.zig:143`,
-`src/crypto/tsumugi_handshake.zig:144`, `src/crypto/tsumugi_handshake.zig:145`).
+signature (`src/crypto/mooring_handshake.zig:141`,
+`src/crypto/mooring_handshake.zig:142`, `src/crypto/mooring_handshake.zig:143`,
+`src/crypto/mooring_handshake.zig:144`, `src/crypto/mooring_handshake.zig:145`).
 
 `secured_s2s_link` adds a TOFU preamble around the AKE: the responder announces
 its signed prekey, the initiator verifies signature and validity, optionally
@@ -232,40 +232,40 @@ pins the expected remote node id, and then starts IK
 
 The initiator verifies both local and responder prekeys, checks realm, enforces
 the MeshPass length cap, then X-Wing encapsulates to the responder's signed
-prekey public key (`src/crypto/tsumugi_handshake.zig:183`,
-`src/crypto/tsumugi_handshake.zig:185`, `src/crypto/tsumugi_handshake.zig:186`,
-`src/crypto/tsumugi_handshake.zig:187`, `src/crypto/tsumugi_handshake.zig:188`,
-`src/crypto/tsumugi_handshake.zig:190`). M1 prefix is header + responder
+prekey public key (`src/crypto/mooring_handshake.zig:183`,
+`src/crypto/mooring_handshake.zig:185`, `src/crypto/mooring_handshake.zig:186`,
+`src/crypto/mooring_handshake.zig:187`, `src/crypto/mooring_handshake.zig:188`,
+`src/crypto/mooring_handshake.zig:190`). M1 prefix is header + responder
 prekey id + X-Wing ciphertext + nonce; the sealed body length and
-ChaCha20-Poly1305 ciphertext/tag follow (`src/crypto/tsumugi_handshake.zig:193`,
-`src/crypto/tsumugi_handshake.zig:195`, `src/crypto/tsumugi_handshake.zig:196`,
-`src/crypto/tsumugi_handshake.zig:197`, `src/crypto/tsumugi_handshake.zig:198`,
-`src/crypto/tsumugi_handshake.zig:199`, `src/crypto/tsumugi_handshake.zig:203`,
-`src/crypto/tsumugi_handshake.zig:209`, `src/crypto/tsumugi_handshake.zig:210`).
+ChaCha20-Poly1305 ciphertext/tag follow (`src/crypto/mooring_handshake.zig:193`,
+`src/crypto/mooring_handshake.zig:195`, `src/crypto/mooring_handshake.zig:196`,
+`src/crypto/mooring_handshake.zig:197`, `src/crypto/mooring_handshake.zig:198`,
+`src/crypto/mooring_handshake.zig:199`, `src/crypto/mooring_handshake.zig:203`,
+`src/crypto/mooring_handshake.zig:209`, `src/crypto/mooring_handshake.zig:210`).
 
 The encrypted M1 payload contains the initiator node id, initiator Ed25519
 public key, initiator signed prekey, requested bands/features, local time,
 MeshPass bytes, and an Ed25519 signature over the M1 transcript digest
-(`src/crypto/tsumugi_handshake.zig:247`, `src/crypto/tsumugi_handshake.zig:253`,
-`src/crypto/tsumugi_handshake.zig:254`, `src/crypto/tsumugi_handshake.zig:255`,
-`src/crypto/tsumugi_handshake.zig:256`, `src/crypto/tsumugi_handshake.zig:257`,
-`src/crypto/tsumugi_handshake.zig:258`, `src/crypto/tsumugi_handshake.zig:259`,
-`src/crypto/tsumugi_handshake.zig:260`, `src/crypto/tsumugi_handshake.zig:262`,
-`src/crypto/tsumugi_handshake.zig:263`). The responder decapsulates, opens M1,
+(`src/crypto/mooring_handshake.zig:247`, `src/crypto/mooring_handshake.zig:253`,
+`src/crypto/mooring_handshake.zig:254`, `src/crypto/mooring_handshake.zig:255`,
+`src/crypto/mooring_handshake.zig:256`, `src/crypto/mooring_handshake.zig:257`,
+`src/crypto/mooring_handshake.zig:258`, `src/crypto/mooring_handshake.zig:259`,
+`src/crypto/mooring_handshake.zig:260`, `src/crypto/mooring_handshake.zig:262`,
+`src/crypto/mooring_handshake.zig:263`). The responder decapsulates, opens M1,
 verifies the initiator prekey, realm, node id/key consistency, anti-downgrade
-bands/features, and M1 signature (`src/crypto/tsumugi_handshake.zig:299`,
-`src/crypto/tsumugi_handshake.zig:301`, `src/crypto/tsumugi_handshake.zig:303`,
-`src/crypto/tsumugi_handshake.zig:304`, `src/crypto/tsumugi_handshake.zig:305`,
-`src/crypto/tsumugi_handshake.zig:306`, `src/crypto/tsumugi_handshake.zig:307`,
-`src/crypto/tsumugi_handshake.zig:308`, `src/crypto/tsumugi_handshake.zig:310`,
-`src/crypto/tsumugi_handshake.zig:311`, `src/crypto/tsumugi_handshake.zig:312`,
-`src/crypto/tsumugi_handshake.zig:313`).
+bands/features, and M1 signature (`src/crypto/mooring_handshake.zig:299`,
+`src/crypto/mooring_handshake.zig:301`, `src/crypto/mooring_handshake.zig:303`,
+`src/crypto/mooring_handshake.zig:304`, `src/crypto/mooring_handshake.zig:305`,
+`src/crypto/mooring_handshake.zig:306`, `src/crypto/mooring_handshake.zig:307`,
+`src/crypto/mooring_handshake.zig:308`, `src/crypto/mooring_handshake.zig:310`,
+`src/crypto/mooring_handshake.zig:311`, `src/crypto/mooring_handshake.zig:312`,
+`src/crypto/mooring_handshake.zig:313`).
 
 Current-state note: `cfg.mesh_pass` is included in encrypted M1. When the
 responder has configured MeshPass signer roots, those bytes must decode to a
 signed MeshPass token whose signed node public key matches the authenticated M1
 node key and whose capabilities include relay role plus the control/sync/irc_app
-/tsumugi frame families. Without signer roots, the responder uses the same
+/mooring frame families. Without signer roots, the responder uses the same
 encrypted bytes as the shared-secret fallback gate and returns
 `MeshPassMismatch` on mismatch.
 
@@ -274,39 +274,39 @@ encrypted bytes as the shared-secret fallback gate and returns
 After validating M1, the responder encapsulates to the initiator's signed
 prekey, computes an M2 secret from the first shared secret, the second shared
 secret, M1, and the M2 prefix, and seals the M2 payload
-(`src/crypto/tsumugi_handshake.zig:316`, `src/crypto/tsumugi_handshake.zig:320`,
-`src/crypto/tsumugi_handshake.zig:321`, `src/crypto/tsumugi_handshake.zig:322`,
-`src/crypto/tsumugi_handshake.zig:324`, `src/crypto/tsumugi_handshake.zig:328`,
-`src/crypto/tsumugi_handshake.zig:330`). M2 payload contains responder node id,
+(`src/crypto/mooring_handshake.zig:316`, `src/crypto/mooring_handshake.zig:320`,
+`src/crypto/mooring_handshake.zig:321`, `src/crypto/mooring_handshake.zig:322`,
+`src/crypto/mooring_handshake.zig:324`, `src/crypto/mooring_handshake.zig:328`,
+`src/crypto/mooring_handshake.zig:330`). M2 payload contains responder node id,
 responder Ed25519 key, accepted bands/features, time, two reserved zero u32
 fields, and an Ed25519 signature over M1 + M2 prefix + payload
-(`src/crypto/tsumugi_handshake.zig:345`, `src/crypto/tsumugi_handshake.zig:356`,
-`src/crypto/tsumugi_handshake.zig:357`, `src/crypto/tsumugi_handshake.zig:358`,
-`src/crypto/tsumugi_handshake.zig:359`, `src/crypto/tsumugi_handshake.zig:360`,
-`src/crypto/tsumugi_handshake.zig:361`, `src/crypto/tsumugi_handshake.zig:362`,
-`src/crypto/tsumugi_handshake.zig:363`, `src/crypto/tsumugi_handshake.zig:364`,
-`src/crypto/tsumugi_handshake.zig:365`).
+(`src/crypto/mooring_handshake.zig:345`, `src/crypto/mooring_handshake.zig:356`,
+`src/crypto/mooring_handshake.zig:357`, `src/crypto/mooring_handshake.zig:358`,
+`src/crypto/mooring_handshake.zig:359`, `src/crypto/mooring_handshake.zig:360`,
+`src/crypto/mooring_handshake.zig:361`, `src/crypto/mooring_handshake.zig:362`,
+`src/crypto/mooring_handshake.zig:363`, `src/crypto/mooring_handshake.zig:364`,
+`src/crypto/mooring_handshake.zig:365`).
 
 The initiator decapsulates M2 using its local prekey secret, opens M2, verifies
 the responder node id/key, anti-downgrade bands/features, and M2 signature, then
-derives `Established` (`src/crypto/tsumugi_handshake.zig:224`,
-`src/crypto/tsumugi_handshake.zig:225`, `src/crypto/tsumugi_handshake.zig:228`,
-`src/crypto/tsumugi_handshake.zig:229`, `src/crypto/tsumugi_handshake.zig:233`,
-`src/crypto/tsumugi_handshake.zig:234`, `src/crypto/tsumugi_handshake.zig:235`,
-`src/crypto/tsumugi_handshake.zig:236`, `src/crypto/tsumugi_handshake.zig:238`,
-`src/crypto/tsumugi_handshake.zig:239`, `src/crypto/tsumugi_handshake.zig:240`,
-`src/crypto/tsumugi_handshake.zig:241`, `src/crypto/tsumugi_handshake.zig:244`).
+derives `Established` (`src/crypto/mooring_handshake.zig:224`,
+`src/crypto/mooring_handshake.zig:225`, `src/crypto/mooring_handshake.zig:228`,
+`src/crypto/mooring_handshake.zig:229`, `src/crypto/mooring_handshake.zig:233`,
+`src/crypto/mooring_handshake.zig:234`, `src/crypto/mooring_handshake.zig:235`,
+`src/crypto/mooring_handshake.zig:236`, `src/crypto/mooring_handshake.zig:238`,
+`src/crypto/mooring_handshake.zig:239`, `src/crypto/mooring_handshake.zig:240`,
+`src/crypto/mooring_handshake.zig:241`, `src/crypto/mooring_handshake.zig:244`).
 
 ### Established keys
 
 `Established` contains a root key, directional send/receive keys and nonces,
 authenticated peer node id, authenticated peer Ed25519 public key, and accepted
-bands/features (`src/crypto/tsumugi_handshake.zig:78`,
-`src/crypto/tsumugi_handshake.zig:79`, `src/crypto/tsumugi_handshake.zig:80`,
-`src/crypto/tsumugi_handshake.zig:81`, `src/crypto/tsumugi_handshake.zig:82`,
-`src/crypto/tsumugi_handshake.zig:83`, `src/crypto/tsumugi_handshake.zig:84`,
-`src/crypto/tsumugi_handshake.zig:85`, `src/crypto/tsumugi_handshake.zig:88`,
-`src/crypto/tsumugi_handshake.zig:89`, `src/crypto/tsumugi_handshake.zig:90`).
+bands/features (`src/crypto/mooring_handshake.zig:78`,
+`src/crypto/mooring_handshake.zig:79`, `src/crypto/mooring_handshake.zig:80`,
+`src/crypto/mooring_handshake.zig:81`, `src/crypto/mooring_handshake.zig:82`,
+`src/crypto/mooring_handshake.zig:83`, `src/crypto/mooring_handshake.zig:84`,
+`src/crypto/mooring_handshake.zig:85`, `src/crypto/mooring_handshake.zig:88`,
+`src/crypto/mooring_handshake.zig:89`, `src/crypto/mooring_handshake.zig:90`).
 The final handshake secret is BLAKE3 over domain `MZ-TSUMUGI-XWING-IK-v1`,
 both X-Wing shared secrets, and the full M1/M2 wires, then HKDF-SHA256 derives:
 
@@ -318,40 +318,40 @@ both X-Wing shared secrets, and the full M1/M2 wires, then HKDF-SHA256 derives:
 | c2s nonce | `"c2s nonce gen0"` | initiator send / responder recv |
 | s2c nonce | `"s2c nonce gen0"` | responder send / initiator recv |
 
-Evidence: `src/crypto/tsumugi_handshake.zig:418`,
-`src/crypto/tsumugi_handshake.zig:421`, `src/crypto/tsumugi_handshake.zig:422`,
-`src/crypto/tsumugi_handshake.zig:423`, `src/crypto/tsumugi_handshake.zig:424`,
-`src/crypto/tsumugi_handshake.zig:425`, `src/crypto/tsumugi_handshake.zig:427`,
-`src/crypto/tsumugi_handshake.zig:434`, `src/crypto/tsumugi_handshake.zig:435`,
-`src/crypto/tsumugi_handshake.zig:436`, `src/crypto/tsumugi_handshake.zig:437`,
-`src/crypto/tsumugi_handshake.zig:439`, `src/crypto/tsumugi_handshake.zig:440`,
-`src/crypto/tsumugi_handshake.zig:441`.
+Evidence: `src/crypto/mooring_handshake.zig:418`,
+`src/crypto/mooring_handshake.zig:421`, `src/crypto/mooring_handshake.zig:422`,
+`src/crypto/mooring_handshake.zig:423`, `src/crypto/mooring_handshake.zig:424`,
+`src/crypto/mooring_handshake.zig:425`, `src/crypto/mooring_handshake.zig:427`,
+`src/crypto/mooring_handshake.zig:434`, `src/crypto/mooring_handshake.zig:435`,
+`src/crypto/mooring_handshake.zig:436`, `src/crypto/mooring_handshake.zig:437`,
+`src/crypto/mooring_handshake.zig:439`, `src/crypto/mooring_handshake.zig:440`,
+`src/crypto/mooring_handshake.zig:441`.
 
-Tsumugi's established key hygiene is source-backed: `Established.deinit` wipes
+Mooring's established key hygiene is source-backed: `Established.deinit` wipes
 the root, send, and receive keys; `deriveEstablished` copies the derived raw
 directional keys into `Secret(T)` wrappers and secure-zeroes the raw stack
 arrays afterward; post-handshake record seal/open declassify directional keys
 into local stack arrays with `defer secureZero(&key)` before using
 ChaCha20-Poly1305. Nonces are directional bases plus per-record counters, so
 each sealed/opened record uses a unique nonce for that direction
-(`src/crypto/tsumugi_handshake.zig:104`, `src/crypto/tsumugi_handshake.zig:108`,
-`src/crypto/tsumugi_handshake.zig:190`, `src/crypto/tsumugi_handshake.zig:207`,
-`src/crypto/tsumugi_handshake.zig:566`, `src/crypto/tsumugi_handshake.zig:581`,
-`src/crypto/tsumugi_session.zig:77`, `src/crypto/tsumugi_session.zig:83`).
+(`src/crypto/mooring_handshake.zig:104`, `src/crypto/mooring_handshake.zig:108`,
+`src/crypto/mooring_handshake.zig:190`, `src/crypto/mooring_handshake.zig:207`,
+`src/crypto/mooring_handshake.zig:566`, `src/crypto/mooring_handshake.zig:581`,
+`src/crypto/mooring_session.zig:77`, `src/crypto/mooring_session.zig:83`).
 
-`tsumugi_session.Session` stores the established state and bridges
+`mooring_session.Session` stores the established state and bridges
 `peer_node_id` to `node_short_id.shortId(peer)` for S2S routing
-(`src/crypto/tsumugi_session.zig:1`, `src/crypto/tsumugi_session.zig:10`,
-`src/crypto/tsumugi_session.zig:11`, `src/crypto/tsumugi_session.zig:14`,
-`src/crypto/tsumugi_session.zig:95`, `src/crypto/tsumugi_session.zig:99`,
-`src/crypto/tsumugi_session.zig:105`, `src/crypto/tsumugi_session.zig:111`,
-`src/crypto/tsumugi_session.zig:112`, `src/crypto/tsumugi_session.zig:146`).
+(`src/crypto/mooring_session.zig:1`, `src/crypto/mooring_session.zig:10`,
+`src/crypto/mooring_session.zig:11`, `src/crypto/mooring_session.zig:14`,
+`src/crypto/mooring_session.zig:95`, `src/crypto/mooring_session.zig:99`,
+`src/crypto/mooring_session.zig:105`, `src/crypto/mooring_session.zig:111`,
+`src/crypto/mooring_session.zig:112`, `src/crypto/mooring_session.zig:146`).
 
 ### Current S2S wiring boundary
 
 `src/daemon/secured_s2s_link.zig` frames only the TOFU prekey preamble, M1, and
 M2 with a u32 little-endian length. Once the AKE establishes, trailing and
-future bytes enter a Tsumugi record layer: complete records are AEAD-opened with
+future bytes enter a Mooring record layer: complete records are AEAD-opened with
 the `Established` receive key and per-record counter AAD before plaintext reaches
 the inner CRDT `S2sLink`; outbound inner bytes are sealed with the send key,
 counter AAD, and a length-prefixed ciphertext+tag record
@@ -361,7 +361,7 @@ counter AAD, and a length-prefixed ciphertext+tag record
 `src/daemon/secured_s2s_link.zig:911`, `src/daemon/secured_s2s_link.zig:916`,
 `src/daemon/secured_s2s_link.zig:930`, `src/daemon/secured_s2s_link.zig:953`,
 `src/daemon/secured_s2s_link.zig:954`). The inner link still owns semantic
-`s2s_frame` parsing, so there is no semantic double-framing: Tsumugi secures the
+`s2s_frame` parsing, so there is no semantic double-framing: Mooring secures the
 byte stream, and `S2sLink` decodes the recovered frame stream.
 
 The server enables secured S2S only when `node_identity` and `crypto_io` are
@@ -382,28 +382,28 @@ capability-gates signed Merkle repair frames (`REPAIR_SUMMARY`,
 `REPAIR_REQUEST`, `REPAIR_RESPONSE`) and applies valid repair responses through
 the CRDT repair substrate before requesting daemon resync
 (`src/proto/s2s_frame.zig:151`, `src/proto/s2s_frame.zig:166`,
-`src/proto/s2s_frame.zig:169`, `src/substrate/suimyaku/s2s_peer.zig:55`,
-`src/substrate/suimyaku/s2s_peer.zig:67`,
-`src/substrate/suimyaku/s2s_peer.zig:592`,
-`src/substrate/suimyaku/s2s_peer.zig:696`,
-`src/substrate/suimyaku/s2s_peer.zig:2118`,
-`src/substrate/suimyaku/s2s_peer.zig:2134`,
-`src/substrate/suimyaku/s2s_peer.zig:2146`).
+`src/proto/s2s_frame.zig:169`, `src/substrate/undertow/s2s_peer.zig:55`,
+`src/substrate/undertow/s2s_peer.zig:67`,
+`src/substrate/undertow/s2s_peer.zig:592`,
+`src/substrate/undertow/s2s_peer.zig:696`,
+`src/substrate/undertow/s2s_peer.zig:2118`,
+`src/substrate/undertow/s2s_peer.zig:2134`,
+`src/substrate/undertow/s2s_peer.zig:2146`).
 
-## Yoroi TLS library and daemon use
+## Armor TLS library and daemon use
 
-Yoroi is the pure-Zig crypto and TLS surface in `src/crypto` and
+Armor is the pure-Zig crypto and TLS surface in `src/crypto` and
 `src/proto/tls_*`; the daemon wires it directly for client TLS, ACME HTTPS, and
 secured S2S.
 
-The same substrate backs a standalone `yoroi` toolkit executable
-(`src/cli/yoroi_main.zig`) built as its own artifact by `build.zig`
+The same substrate backs a standalone `armor` toolkit executable
+(`src/cli/armor_main.zig`) built as its own artifact by `build.zig`
 (`build.zig:458`, `build.zig:459`, `build.zig:471`). It exposes openssl-parity
 verbs — `x509`, `genpkey`, `pkey`, `req`, `dgst`, `verify`, `rand`, `ciphers`,
 `asn1parse` — with deterministic scriptable exit codes (`0` ok, `1` failed,
 `2` usage, `3` not implemented), and never shells out to OpenSSL: each verb
 routes through the Zig crypto modules above (`src/cli/root.zig`,
-`src/cli/yoroi_main.zig:4`). `s_client`/`s_server`/`enc`/`ocsp`/`crl` are
+`src/cli/armor_main.zig:4`). `s_client`/`s_server`/`enc`/`ocsp`/`crl` are
 declared but return exit `3` (not yet implemented). The CLI has its own test
 step, `zig build test-cli` (`build.zig:478`).
 
@@ -481,7 +481,7 @@ closes fail-safe on error (`src/daemon/ktls.zig:37`,
 
 ### X.509, OCSP, SCT, and CRL parsing
 
-Yoroi's X.509/DER reader is deliberately minimal and fail-closed: it refuses
+Armor's X.509/DER reader is deliberately minimal and fail-closed: it refuses
 empty, oversized, over-depth, truncated, trailing, non-canonical, indefinite,
 unsupported, or structurally invalid DER before higher layers consume
 certificate fields. Extension parsing requires each extension to be a DER
@@ -547,7 +547,7 @@ structures. Examples:
 
 Two similarly named surfaces share the MeshPass name:
 
-1. `tsumugi_handshake.Config.mesh_pass`: bytes inserted into encrypted M1 with a
+1. `mooring_handshake.Config.mesh_pass`: bytes inserted into encrypted M1 with a
    length cap. With configured signer roots these bytes are a signed MeshPass
    admission token; otherwise they are the shared-secret fallback.
 2. `src/proto/meshpass.zig`: a signed admission/capability token format.
@@ -617,7 +617,7 @@ then verifies Ed25519 and freshness (`src/proto/oper_cred_share.zig:213`,
 `src/proto/oper_cred_share.zig:244`).
 
 On secured S2S links, inbound grant payloads are verified against
-`peerNodeKey()`, the authenticated Ed25519 key learned from Tsumugi, before they
+`peerNodeKey()`, the authenticated Ed25519 key learned from Mooring, before they
 can confer operator authority (`src/daemon/secured_s2s_link.zig:127`,
 `src/daemon/secured_s2s_link.zig:129`, `src/daemon/secured_s2s_link.zig:167`,
 `src/daemon/secured_s2s_link.zig:176`, `src/daemon/server.zig:2650`,
@@ -677,7 +677,7 @@ from the live `secured_s2s_link` behavior described above.
 | 1:1 channel | HPKE bootstraps a shared root; a Signal-style double ratchet provides per-frame AEAD. | `src/crypto/secure_channel.zig:1`, `src/crypto/secure_channel.zig:4`, `src/crypto/secure_channel.zig:5`, `src/crypto/secure_channel.zig:61`, `src/crypto/secure_channel.zig:66`, `src/crypto/secure_channel.zig:76`, `src/crypto/secure_channel.zig:77`, `src/crypto/secure_channel.zig:78`, `src/crypto/secure_channel.zig:83`, `src/crypto/secure_channel.zig:91`, `src/crypto/secure_channel.zig:93` |
 | Group channel | TreeKEM derives a group root; add/remove/update rekeys. | `src/crypto/secure_channel.zig:7`, `src/crypto/secure_channel.zig:113`, `src/crypto/secure_channel.zig:114`, `src/crypto/secure_channel.zig:118`, `src/crypto/secure_channel.zig:127`, `src/crypto/secure_channel.zig:131`, `src/crypto/secure_channel.zig:135`, `src/crypto/secure_channel.zig:139` |
 
-The module comments state that live wiring onto S2S waits on Tsumugi identity and
+The module comments state that live wiring onto S2S waits on Mooring identity and
 that the module is transport-agnostic (`src/crypto/secure_channel.zig:10`,
 `src/crypto/secure_channel.zig:11`, `src/crypto/secure_channel.zig:12`,
 `src/crypto/secure_channel.zig:13`). Therefore, document it as available crypto
@@ -734,33 +734,33 @@ for them (`src/crypto/treekem.zig:376`, `src/crypto/treekem.zig:384`,
 `src/crypto/treekem.zig:401`, `src/crypto/treekem.zig:405`,
 `src/crypto/treekem.zig:421`).
 
-### proto/tsumugi.zig frame ratchet
+### proto/mooring.zig frame ratchet
 
-`src/proto/tsumugi.zig` is a symmetric ratchet for post-kx SUIMYAKU frames. It
+`src/proto/mooring.zig` is a symmetric ratchet for post-kx UNDERTOW frames. It
 does not perform X25519, ML-KEM, or identity work; it expects an authenticated
-hybrid root secret from a lower layer (`src/proto/tsumugi.zig:1`,
-`src/proto/tsumugi.zig:3`, `src/proto/tsumugi.zig:4`,
-`src/proto/tsumugi.zig:5`). It splits that root into initiator/responder
+hybrid root secret from a lower layer (`src/proto/mooring.zig:1`,
+`src/proto/mooring.zig:3`, `src/proto/mooring.zig:4`,
+`src/proto/mooring.zig:5`). It splits that root into initiator/responder
 send/receive chains with HKDF labels, encrypts frames with ChaCha20-Poly1305,
 tracks replay/too-far-ahead state, and emits rekey signals by frame interval,
-epoch, or counter exhaustion (`src/proto/tsumugi.zig:19`,
-`src/proto/tsumugi.zig:21`, `src/proto/tsumugi.zig:22`,
-`src/proto/tsumugi.zig:23`, `src/proto/tsumugi.zig:92`,
-`src/proto/tsumugi.zig:109`, `src/proto/tsumugi.zig:126`,
-`src/proto/tsumugi.zig:127`, `src/proto/tsumugi.zig:129`,
-`src/proto/tsumugi.zig:136`, `src/proto/tsumugi.zig:179`,
-`src/proto/tsumugi.zig:341`, `src/proto/tsumugi.zig:345`,
-`src/proto/tsumugi.zig:346`, `src/proto/tsumugi.zig:347`,
-`src/proto/tsumugi.zig:358`, `src/proto/tsumugi.zig:359`,
-`src/proto/tsumugi.zig:367`, `src/proto/tsumugi.zig:377`,
-`src/proto/tsumugi.zig:381`). Its tests verify that AEAD AAD binds frame kind,
-generation, counter, and outer header (`src/proto/tsumugi.zig:731`,
-`src/proto/tsumugi.zig:741`, `src/proto/tsumugi.zig:742`,
-`src/proto/tsumugi.zig:744`, `src/proto/tsumugi.zig:750`,
-`src/proto/tsumugi.zig:753`).
+epoch, or counter exhaustion (`src/proto/mooring.zig:19`,
+`src/proto/mooring.zig:21`, `src/proto/mooring.zig:22`,
+`src/proto/mooring.zig:23`, `src/proto/mooring.zig:92`,
+`src/proto/mooring.zig:109`, `src/proto/mooring.zig:126`,
+`src/proto/mooring.zig:127`, `src/proto/mooring.zig:129`,
+`src/proto/mooring.zig:136`, `src/proto/mooring.zig:179`,
+`src/proto/mooring.zig:341`, `src/proto/mooring.zig:345`,
+`src/proto/mooring.zig:346`, `src/proto/mooring.zig:347`,
+`src/proto/mooring.zig:358`, `src/proto/mooring.zig:359`,
+`src/proto/mooring.zig:367`, `src/proto/mooring.zig:377`,
+`src/proto/mooring.zig:381`). Its tests verify that AEAD AAD binds frame kind,
+generation, counter, and outer header (`src/proto/mooring.zig:731`,
+`src/proto/mooring.zig:741`, `src/proto/mooring.zig:742`,
+`src/proto/mooring.zig:744`, `src/proto/mooring.zig:750`,
+`src/proto/mooring.zig:753`).
 
-`frame.zig` reserves Tsumugi frame types for handshake, handshake response,
-ratchet, and group key; the Tsumugi band is treated as control priority and
+`frame.zig` reserves Mooring frame types for handshake, handshake response,
+ratchet, and group key; the Mooring band is treated as control priority and
 does not debit credit (`src/proto/frame.zig:131`, `src/proto/frame.zig:132`,
 `src/proto/frame.zig:133`, `src/proto/frame.zig:134`,
 `src/proto/frame.zig:220`, `src/proto/frame.zig:227`,
@@ -773,7 +773,7 @@ CoilPack has two layers:
 
 | Layer | Purpose | Source |
 | --- | --- | --- |
-| `coilpack.zig` | Low-level atoms: little-endian fixed integers, minimal unsigned LEB128 varints, length-prefixed byte strings, booleans, and the fixed SUIMYAKU header. Decoders reject non-minimal varints; canonical equality is byte equality. | `src/proto/coilpack.zig:1`, `src/proto/coilpack.zig:3`, `src/proto/coilpack.zig:5`, `src/proto/coilpack.zig:25`, `src/proto/coilpack.zig:26`, `src/proto/coilpack.zig:29`, `src/proto/coilpack.zig:106`, `src/proto/coilpack.zig:126`, `src/proto/coilpack.zig:127`, `src/proto/coilpack.zig:237`, `src/proto/coilpack.zig:253` |
+| `coilpack.zig` | Low-level atoms: little-endian fixed integers, minimal unsigned LEB128 varints, length-prefixed byte strings, booleans, and the fixed UNDERTOW header. Decoders reject non-minimal varints; canonical equality is byte equality. | `src/proto/coilpack.zig:1`, `src/proto/coilpack.zig:3`, `src/proto/coilpack.zig:5`, `src/proto/coilpack.zig:25`, `src/proto/coilpack.zig:26`, `src/proto/coilpack.zig:29`, `src/proto/coilpack.zig:106`, `src/proto/coilpack.zig:126`, `src/proto/coilpack.zig:127`, `src/proto/coilpack.zig:237`, `src/proto/coilpack.zig:253` |
 | `coilpack_value.zig` | Structured canonical values: nil, booleans, u64, i64, bytes, UTF-8 strings, arrays, and maps. Encoder sorts map entries by raw key bytes; decoder rejects unsorted or duplicate keys, invalid UTF-8, truncation, trailing bytes, and overlong varints. | `src/proto/coilpack_value.zig:1`, `src/proto/coilpack_value.zig:7`, `src/proto/coilpack_value.zig:10`, `src/proto/coilpack_value.zig:11`, `src/proto/coilpack_value.zig:12`, `src/proto/coilpack_value.zig:17`, `src/proto/coilpack_value.zig:29`, `src/proto/coilpack_value.zig:86`, `src/proto/coilpack_value.zig:131`, `src/proto/coilpack_value.zig:134`, `src/proto/coilpack_value.zig:206`, `src/proto/coilpack_value.zig:222`, `src/proto/coilpack_value.zig:224`, `src/proto/coilpack_value.zig:226`, `src/proto/coilpack_value.zig:331`, `src/proto/coilpack_value.zig:340`, `src/proto/coilpack_value.zig:346` |
 
 The generic signing composition is in `signed_object.zig`, which signs the
@@ -802,7 +802,7 @@ same signed fields before Ed25519 verification (`src/proto/meshpass.zig:216`,
 | Do not claim | Current source evidence |
 | --- | --- |
 | Do not claim STARTTLS support. | The daemon's TLS is implicit only; `dispatch.zig` notes STARTTLS is "deliberately never implement[ed]". |
-| Do not claim `secure_channel.zig` is live S2S wiring. | Its own header comment says live wiring waits on Tsumugi and the module is transport-agnostic. |
+| Do not claim `secure_channel.zig` is live S2S wiring. | Its own header comment says live wiring waits on Mooring and the module is transport-agnostic. |
 | Do not claim `Secret(T)` makes all secret-dependent branches impossible by itself. | `Secret(T)` enforces explicit exposure/declassification, redacted formatting, constant-time equality, byte-wrapper checks, and wipes, but exposed/declassified bytes can still be branched on by ordinary code (`src/crypto/secret.zig:27`, `src/crypto/secret.zig:63`, `src/crypto/secret.zig:100`, `src/crypto/secret.zig:129`). |
 | Do not claim TLS 1.3 or TLS 1.2 `sealRecord`/`openRecord` stack key copies are currently secure-zeroed. | The current TLS record helpers copy AEAD keys into local arrays/values without a matching `defer secureZero(&key)`: TLS 1.3 server seal/open copies at `src/crypto/tls_server.zig:2899`, `src/crypto/tls_server.zig:2905`, `src/crypto/tls_server.zig:2911`, `src/crypto/tls_server.zig:2930`, `src/crypto/tls_server.zig:2935`, `src/crypto/tls_server.zig:2940`; TLS 1.2 seal/open copies at `src/crypto/tls12.zig:405`, `src/crypto/tls12.zig:412`, `src/crypto/tls12.zig:419`, `src/crypto/tls12.zig:464`, `src/crypto/tls12.zig:471`, `src/crypto/tls12.zig:478`. |
 | Do not claim ECH is signaled across a HelloRetryRequest. | ECH acceptance is confirmed ONLY on the ServerHello of a single-round handshake. ECH+HRR is deferred: a `ClientHelloOuter` the server opened (`ech_accepted`) that then needs an HRR reaches `writeServerHello` again with `hrr_sent` set, where the confirmation is deliberately NOT stamped so the path fail-closes rather than emitting an unreproducible signal (`signal_ech = ech_accepted and !hrr_sent`). The orochi client stands ECH+HRR down to plain; only a client withholding its inner key_share could reach this path. Status is being revisited in a parallel change — treat this as the verified current behavior, not the final design. | `src/crypto/tls_server.zig:1906`, `src/crypto/tls_server.zig:1911` |
@@ -811,5 +811,5 @@ same signed fields before Ed25519 verification (`src/proto/meshpass.zig:216`,
 The following former guardrails are now OBSOLETE — the capabilities they cautioned against ARE implemented as of this writing, so claiming them is correct:
 
 - **TLS server PQ/hybrid groups:** `tls_server.zig` selects `x25519mlkem768` and performs the real X25519 ECDH + ML-KEM decapsulation when a client offers the hybrid share.
-- **`secured_s2s_link` encrypts CRDT frames:** a Post-AKE AEAD record layer (ChaCha20-Poly1305) seals every byte with the Tsumugi `Established` `send_key`/`recv_key` and opens with per-record counters.
-- **MeshPass enforced by the Tsumugi responder:** M1 carries admission bytes encrypted. Configured signer roots require a signed token bound to the peer node key and S2S frame-family capabilities; otherwise the responder constant-time-compares the shared-secret fallback.
+- **`secured_s2s_link` encrypts CRDT frames:** a Post-AKE AEAD record layer (ChaCha20-Poly1305) seals every byte with the Mooring `Established` `send_key`/`recv_key` and opens with per-record counters.
+- **MeshPass enforced by the Mooring responder:** M1 carries admission bytes encrypted. Configured signer roots require a signed token bound to the peer node key and S2S frame-family capabilities; otherwise the responder constant-time-compares the shared-secret fallback.

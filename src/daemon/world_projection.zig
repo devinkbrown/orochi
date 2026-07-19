@@ -5,7 +5,7 @@
 //! membership into a single NAMES/WHO member list.
 //!
 //! Design decisions resolved here (see docs/planning/12):
-//!   * The Suimyaku channel CRDT keys members by an opaque `u64` MemberId and
+//!   * The Undertow channel CRDT keys members by an opaque `u64` MemberId and
 //!     stores ONLY mode/status bits — it carries no nick/user/host. So remote
 //!     *identity* (nick) is NOT derivable from the CRDT alone; it must be carried
 //!     by the routing/gossip layer. This module therefore takes remote members as

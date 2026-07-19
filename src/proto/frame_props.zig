@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Deterministic property tests for the SUIMYAKU frame layer.
+//! Deterministic property tests for the UNDERTOW frame layer.
 const std = @import("std");
 const frame = @import("frame.zig");
 
@@ -88,9 +88,9 @@ fn randomFrameType(random: std.Random, iteration: usize) frame.FrameType {
         @intFromEnum(frame.FrameType.ping),
         @intFromEnum(frame.FrameType.privmsg),
         @intFromEnum(frame.FrameType.irc_line),
-        @intFromEnum(frame.FrameType.goryu_delta),
+        @intFromEnum(frame.FrameType.concord_delta),
         @intFromEnum(frame.FrameType.cap_grant),
-        @intFromEnum(frame.FrameType.tsumugi_ratchet),
+        @intFromEnum(frame.FrameType.mooring_ratchet),
         @intFromEnum(frame.FrameType.voice_data),
         0x1f,
         0x8c,
@@ -288,7 +288,7 @@ test "credit flow accounting never underflows or overflows silently" {
         const payload_len = randomPayloadLen(random, i) + @as(usize, if (i % 113 == 0) 1 else 0);
         const frame_type: frame.FrameType = switch (i % 9) {
             0 => .ping,
-            1 => .tsumugi_ratchet,
+            1 => .mooring_ratchet,
             else => randomFrameType(random, i),
         };
         const candidate = frame.Frame{

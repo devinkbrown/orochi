@@ -4,7 +4,7 @@
 //! Real-time activity schemas: typing, reactions, and presence.
 //!
 //! Clean-room server-side data model for the Event-Spine "activity stream"
-//! (planning/13): typed representations the daemon stores, converges (Goryu
+//! (planning/13): typed representations the daemon stores, converges (Concord
 //! CRDT for reactions), and pushes to `ACTIVITY SUBSCRIBE`rs. The IRCv3 tag
 //! *relay* already lives in `message_tags_relay`; this is the typed layer
 //! underneath — parsing tag values into states, and one tagged union the

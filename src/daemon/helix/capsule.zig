@@ -32,7 +32,7 @@ pub const CapsuleKind = enum(u8) {
     channels = 2,
     sessions = 3,
     tls_session = 4,
-    tsumugi_ratchet = 5,
+    mooring_ratchet = 5,
     mesh_checkpoint = 6,
     send_queue = 7,
     s2s_link = 8,
@@ -52,7 +52,7 @@ pub const CapsuleKind = enum(u8) {
             2 => .channels,
             3 => .sessions,
             4 => .tls_session,
-            5 => .tsumugi_ratchet,
+            5 => .mooring_ratchet,
             6 => .mesh_checkpoint,
             7 => .send_queue,
             8 => .s2s_link,
@@ -72,14 +72,14 @@ pub const CapsuleKind = enum(u8) {
     /// Whether a capsule of this kind carries raw cryptographic key material in
     /// its field payloads, so `Capsule.deinit` secure-zeroes the owned bytes
     /// before freeing them. Key material sealed into the successor's memfd arena
-    /// (TLS 1.3/1.2 traffic secrets, the Tsumugi directional record keys, and the
+    /// (TLS 1.3/1.2 traffic secrets, the Mooring directional record keys, and the
     /// STEK ticket keys) must never linger in freed heap across a USR2 — the
     /// arena lives only in memory, but a freed-then-reused allocation could leak
     /// it to unrelated state. The switch is exhaustive so a new secret-bearing
     /// kind is a compile error until this decision is made for it.
     pub fn carriesSecrets(kind: CapsuleKind) bool {
         return switch (kind) {
-            .tls_session, .tsumugi_ratchet, .s2s_link, .tls_ticket_keys => true,
+            .tls_session, .mooring_ratchet, .s2s_link, .tls_ticket_keys => true,
             .clients,
             .channels,
             .sessions,
@@ -154,7 +154,7 @@ pub const registry = [_]Descriptor{
     // this binary must not netsplit); `tls_snapshot.decode` is version-aware (the
     // v1 arm tolerates the flags being absent OR present, v2 requires them).
     .{ .kind = .tls_session, .schema_id = 0x4854_4c53, .current_version = 2, .min_supported = 1, .max_supported = 2 },
-    .{ .kind = .tsumugi_ratchet, .schema_id = 0x4856_4549, .current_version = 1, .min_supported = 1, .max_supported = 1 },
+    .{ .kind = .mooring_ratchet, .schema_id = 0x4856_4549, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // v2 (2026-07) introduces exact property-state checkpoints. Ordinary
     // magic-discriminated mesh payloads retain the full 1..2 range so a v1
     // successor can still consume/skip them. A state piece whose loss would be
@@ -256,7 +256,7 @@ pub const Capsule = struct {
     fields: []Field,
 
     pub fn deinit(self: *Capsule, allocator: Allocator) void {
-        // Secure-zero key-material payloads before freeing so no TLS/Tsumugi/
+        // Secure-zero key-material payloads before freeing so no TLS/Mooring/
         // ticket-key bytes survive in a reused allocation. Owned (duped) field
         // bytes are the only thing deinit frees, so wiping them is in-bounds.
         wipeSecretPayloads(self.header.kind, self.fields);
@@ -619,7 +619,7 @@ test "validate is forward-tolerant of a too-new version (rejection is above this
 test "wipeSecretPayloads zeroes secret-bearing payloads and leaves plain ones" {
     try std.testing.expect(CapsuleKind.tls_session.carriesSecrets());
     try std.testing.expect(CapsuleKind.s2s_link.carriesSecrets());
-    try std.testing.expect(CapsuleKind.tsumugi_ratchet.carriesSecrets());
+    try std.testing.expect(CapsuleKind.mooring_ratchet.carriesSecrets());
     try std.testing.expect(CapsuleKind.tls_ticket_keys.carriesSecrets());
     try std.testing.expect(!CapsuleKind.clients.carriesSecrets());
     try std.testing.expect(!CapsuleKind.channels.carriesSecrets());

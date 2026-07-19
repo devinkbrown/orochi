@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Native media link — the live-transport glue for the native Suimyaku SFU leg.
+//! Native media link — the live-transport glue for the native Undertow SFU leg.
 //!
 //! `NativeMediaPlane` (substrate) makes the pure forwarding *decision* in terms
-//! of `ParticipantId`s; live datagrams instead carry an kagura_frame `stream_id`
+//! of `ParticipantId`s; live datagrams instead carry a cadence_frame `stream_id`
 //! and arrive from / depart to a `TransportAddress`. This module is the binding
 //! between the two: it owns the per-call registry mapping
 //!
@@ -13,7 +13,7 @@
 //!
 //! so a raw inbound native datagram can be turned into "forward these exact bytes
 //! to this set of addresses". It NEVER touches the payload — the SFU forwards the
-//! opaque, already-encoded kagura frame verbatim (no encode/decode/transcode).
+//! opaque, already-encoded cadence frame verbatim (no encode/decode/transcode).
 //!
 //! Layer selection: the container's `band_id` encodes the spatial layer by the
 //! convention `band_id = MEDIA_BAND_FLOOR + spatial` (the publisher chooses the
@@ -27,7 +27,7 @@
 //! `inbound` and sends the opaque datagram to each returned address.
 const std = @import("std");
 const native_plane = @import("../substrate/native_media_plane.zig");
-const kagura_frame = @import("../substrate/kagura_frame.zig");
+const cadence_frame = @import("../substrate/cadence_frame.zig");
 const media_transport = @import("../substrate/media_transport.zig");
 
 pub const ParticipantId = native_plane.ParticipantId;
@@ -103,7 +103,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
         }
 
         /// Bind or verify the transport address for `stream_id`. Used by native
-        /// control feedback, which does not carry a kagura frame but still needs
+        /// control feedback, which does not carry a cadence frame but still needs
         /// the same anti-spoofing address ownership as media datagrams.
         pub fn bindAddressForStream(self: *Self, stream_id: u32, from: TransportAddress) bool {
             for (self.entries[0..self.len]) |*e| {
@@ -217,7 +217,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             datagram: []const u8,
             out: []TransportAddress,
         ) usize {
-            const view = kagura_frame.decode(datagram) catch return 0;
+            const view = cadence_frame.decode(datagram) catch return 0;
             return self.forwardView(view, datagram.len, out);
         }
 
@@ -230,7 +230,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             from: TransportAddress,
             out: []TransportAddress,
         ) usize {
-            const view = kagura_frame.decode(datagram) catch return 0;
+            const view = cadence_frame.decode(datagram) catch return 0;
             for (self.entries[0..self.len]) |*e| {
                 if (e.live and e.stream_id == view.stream_id) {
                     if (e.addr_bound and !e.addr.eql(from)) return 0;
@@ -242,7 +242,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             return self.forwardView(view, datagram.len, out);
         }
 
-        fn forwardView(self: *Self, view: kagura_frame.FrameView, datagram_len: usize, out: []TransportAddress) usize {
+        fn forwardView(self: *Self, view: cadence_frame.FrameView, datagram_len: usize, out: []TransportAddress) usize {
             // Identify the publishing participant by the frame's stream_id, and
             // meter the frame against that publisher.
             var src_id: ?ParticipantId = null;
@@ -259,7 +259,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
             const source = src_id orelse return 0;
 
             // band_id = MEDIA_BAND_FLOOR + spatial (publisher convention).
-            const spatial: u8 = @intCast(view.band_id - kagura_frame.MEDIA_BAND_FLOOR);
+            const spatial: u8 = @intCast(view.band_id - cadence_frame.MEDIA_BAND_FLOOR);
 
             var ids: [max_participants]ParticipantId = undefined;
             const m = self.plane.forward(source, src_kind, spatial, 0, view.keyframe, &ids);
@@ -278,7 +278,7 @@ pub fn NativeMediaLink(comptime max_participants: usize) type {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (run under the unified build; transitively imports kagura via the
+// Tests (run under the unified build; transitively imports cadence via the
 // native plane, so not standalone `zig test`-able — expected).
 // ---------------------------------------------------------------------------
 
@@ -289,13 +289,13 @@ fn mkAddr(last: u8, port: u16) TransportAddress {
 }
 
 fn frame(stream_id: u32, band: u8, seq: u32, keyframe: bool, buf: []u8) []const u8 {
-    const n = kagura_frame.encode(.{
+    const n = cadence_frame.encode(.{
         .band_id = band,
         .stream_id = stream_id,
         .sequence = seq,
         .timestamp = 0,
         .keyframe = keyframe,
-        .codec = .kaguravox_audio,
+        .codec = .cadencevox_audio,
         .payload = &[_]u8{ 0xAA, 0xBB, 0xCC },
     }, buf) catch unreachable;
     return buf[0..n];
@@ -303,7 +303,7 @@ fn frame(stream_id: u32, band: u8, seq: u32, keyframe: bool, buf: []u8) []const 
 
 test "inbound forwards a base-layer frame to the other registered addresses" {
     var link = NativeMediaLink(8).init();
-    const floor = kagura_frame.MEDIA_BAND_FLOOR;
+    const floor = cadence_frame.MEDIA_BAND_FLOOR;
     try link.register("alice", .voice, 100, mkAddr(1, 5000));
     try link.register("bob", .voice, 200, mkAddr(2, 5000));
     try link.register("carol", .voice, 300, mkAddr(3, 5000));
@@ -324,14 +324,14 @@ test "inbound drops an unknown stream_id" {
     try link.register("bob", .voice, 200, mkAddr(2, 5000));
 
     var fbuf: [64]u8 = undefined;
-    const dgram = frame(999, kagura_frame.MEDIA_BAND_FLOOR, 1, false, &fbuf);
+    const dgram = frame(999, cadence_frame.MEDIA_BAND_FLOOR, 1, false, &fbuf);
     var out: [8]TransportAddress = undefined;
     try testing.expectEqual(@as(usize, 0), link.inbound(dgram, &out));
 }
 
 test "spatial ceiling drops higher band but keyframes always pass" {
     var link = NativeMediaLink(8).init();
-    const floor = kagura_frame.MEDIA_BAND_FLOOR;
+    const floor = cadence_frame.MEDIA_BAND_FLOOR;
     try link.register("src", .video, 10, mkAddr(1, 6000));
     try link.register("lowbw", .video, 11, mkAddr(2, 6000));
     link.setSelection("lowbw", .{ .max_spatial = 0, .max_temporal = 0 });
@@ -349,7 +349,7 @@ test "spatial ceiling drops higher band but keyframes always pass" {
 
 test "unregister removes a participant from the forward set" {
     var link = NativeMediaLink(8).init();
-    const floor = kagura_frame.MEDIA_BAND_FLOOR;
+    const floor = cadence_frame.MEDIA_BAND_FLOOR;
     try link.register("a", .voice, 1, mkAddr(1, 7000));
     try link.register("b", .voice, 2, mkAddr(2, 7000));
 
@@ -373,7 +373,7 @@ test "register refuses new native participants at runtime cap" {
 
 test "inboundFrom learns the publisher's address and still forwards to others" {
     var link = NativeMediaLink(8).init();
-    const floor = kagura_frame.MEDIA_BAND_FLOOR;
+    const floor = cadence_frame.MEDIA_BAND_FLOOR;
     // alice registered with a placeholder address (unknown until she sends).
     try link.register("alice", .voice, 100, mkAddr(0, 0));
     try link.register("bob", .voice, 200, mkAddr(2, 9000));
@@ -396,7 +396,7 @@ test "inboundFrom learns the publisher's address and still forwards to others" {
 
 test "inboundFrom rejects a bound stream_id from a different source address" {
     var link = NativeMediaLink(8).init();
-    const floor = kagura_frame.MEDIA_BAND_FLOOR;
+    const floor = cadence_frame.MEDIA_BAND_FLOOR;
     try link.register("alice", .voice, 100, mkAddr(0, 0));
     try link.register("bob", .voice, 200, mkAddr(2, 9000));
 
@@ -409,7 +409,7 @@ test "inboundFrom rejects a bound stream_id from a different source address" {
 
 test "stats meter received frames against the publisher" {
     var link = NativeMediaLink(8).init();
-    const floor = kagura_frame.MEDIA_BAND_FLOOR;
+    const floor = cadence_frame.MEDIA_BAND_FLOOR;
     try link.register("alice", .voice, 100, mkAddr(1, 5000));
     try link.register("bob", .voice, 200, mkAddr(2, 5000));
 
@@ -435,7 +435,7 @@ test "stats meter received frames against the publisher" {
 
 test "updateAddress redirects a receiver's copies" {
     var link = NativeMediaLink(8).init();
-    const floor = kagura_frame.MEDIA_BAND_FLOOR;
+    const floor = cadence_frame.MEDIA_BAND_FLOOR;
     try link.register("a", .voice, 1, mkAddr(1, 8000));
     try link.register("b", .voice, 2, mkAddr(2, 8000));
     link.updateAddress("b", mkAddr(9, 8001));

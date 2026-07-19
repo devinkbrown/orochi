@@ -4,7 +4,7 @@
 //! Mesh re-dial hints carried across a Helix UPGRADE.
 //!
 //! S2S peer sockets are deliberately NOT preserved across the execve: the
-//! secured Tsumugi link's post-AKE stream cannot be re-entered mid-connection,
+//! secured Mooring link's post-AKE stream cannot be re-entered mid-connection,
 //! so the predecessor lets the socket close at exec (the peer sees the drop
 //! instantly) and instead seals one of these hints per initiator-side link.
 //! The successor dials every hint as soon as it boots, shrinking the netsplit

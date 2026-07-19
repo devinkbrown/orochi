@@ -64,7 +64,7 @@ fn baseFields(node_pubkey: meshpass.PublicKeyBytes, realm: []const u8) meshpass.
         .roles = meshpass.roles(&.{ .operator, .relay, .media }),
         .issued_ms = 1_000,
         .expiry_ms = 10_000,
-        .allowed_frame_families = meshpass.frameFamilies(&.{ .control, .sync, .irc_app, .tsumugi }),
+        .allowed_frame_families = meshpass.frameFamilies(&.{ .control, .sync, .irc_app, .mooring }),
         .max_fanout = 16,
         .media_rights = meshpass.mediaRights(&.{ .voice, .video, .data }),
         .revocation_epoch = 7,
@@ -254,7 +254,7 @@ test "trusted roots verify while untrusted roots and realm mismatches are reject
 
     const wrong_realm_root = meshpass.TrustRoot{
         .public_key = issuer.public_key.toBytes(),
-        .realm = "suimyaku-other",
+        .realm = "undertow-other",
     };
     try std.testing.expectError(error.WrongRealm, meshpass.verify(token, wrong_realm_root, 2_000));
 }

@@ -32,7 +32,7 @@
 //! ## Distinction from the substrate CRDTs
 //!
 //! `src/substrate/crdt_orset.zig` keys on `u64` with generated `(replica,
-//! counter)` dots, and `goryu.OrSet(T)` is a delta-state generic comparing
+//! counter)` dots, and `concord.OrSet(T)` is a delta-state generic comparing
 //! values with `std.meta.eql` (slice identity, not byte content, for strings).
 //! This module is a concrete, state-based OR-Set over **owned string elements**
 //! with **caller-supplied string tags** and an `elements(buf)` extractor —

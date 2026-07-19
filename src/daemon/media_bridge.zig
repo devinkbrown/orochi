@@ -4,37 +4,37 @@
 //! Media bridge spine — per-channel cross-leg roster + datagram rewrap.
 //!
 //! A media call can mix participants on two transports: the native leg
-//! (kagura_frame over UDP, our KaguraVox/KaguraVis codec) and the WebRTC leg (RTP/SRTP).
+//! (cadence_frame over UDP, our CadenceVox/CadenceVis codec) and the WebRTC leg (RTP/SRTP).
 //! Within a leg the respective plane already forwards. This module is the spine
 //! that lets a frame ingressing on ONE leg reach participants on the OTHER leg —
 //! by header-rewrap only, never transcoding. The codec payload is opaque and
-//! shared verbatim; only the transport header (kagura container ↔ RTP) changes.
+//! shared verbatim; only the transport header (cadence container ↔ RTP) changes.
 //!
 //! `ChannelBridge` holds the call's roster (who is on which leg + their transport
 //! identity) and answers `crossTargets(leg)` — the opposite-leg recipients for a
 //! frame that arrived on `leg`. The free `*Datagram` helpers do the actual
-//! rewrap, reusing `kakehashi`. The two live pumps (native + WebRTC) will call
+//! rewrap, reusing `causeway`. The two live pumps (native + WebRTC) will call
 //! these to deliver across legs.
 //!
 //! Pure SFU: this never encodes/decodes/transcodes media. A mixed call still
-//! requires a shared codec (`kakehashi.selectCommon`); rewrap just moves the
+//! requires a shared codec (`causeway.selectCommon`); rewrap just moves the
 //! agreed opaque payload between the two wire framings.
 const std = @import("std");
-const kakehashi = @import("../substrate/kakehashi.zig");
-const kakehashi_session = @import("../substrate/kakehashi_session.zig");
+const causeway = @import("../substrate/causeway.zig");
+const causeway_session = @import("../substrate/causeway_session.zig");
 const ssrc_map_mod = @import("../substrate/ssrc_map.zig");
-const kagura_frame = @import("../substrate/kagura_frame.zig");
+const cadence_frame = @import("../substrate/cadence_frame.zig");
 const native_feedback = @import("../substrate/native_feedback.zig");
 const rtcp_translate = @import("../proto/rtcp_translate.zig");
 const rtp_profile = @import("../proto/rtp_profile.zig");
 const ice = @import("../proto/ice.zig");
 
-pub const Leg = kakehashi.Leg; // .native | .webrtc
-pub const Codec = kakehashi.Codec;
+pub const Leg = causeway.Leg; // .native | .webrtc
+pub const Codec = causeway.Codec;
 pub const TransportAddress = ice.TransportAddress;
-pub const PtMap = kakehashi.PtMap;
+pub const PtMap = causeway.PtMap;
 
-pub const Error = kakehashi.Error || kagura_frame.DecodeError || kagura_frame.EncodeError;
+pub const Error = causeway.Error || cadence_frame.DecodeError || cadence_frame.EncodeError;
 
 const max_id_bytes = 64;
 pub const max_member_codecs = 8;
@@ -87,8 +87,8 @@ pub const RtpCrossSink = struct {
 /// when a call hasn't negotiated a custom mapping.
 pub fn defaultPtMap() PtMap {
     var m = PtMap{};
-    m.add(111, .kaguravox); // audio
-    m.add(96, .kaguravis); // video
+    m.add(111, .cadencevox); // audio
+    m.add(96, .cadencevis); // video
     return m;
 }
 
@@ -102,9 +102,9 @@ pub const Member = struct {
     id_len: u8 = 0,
     leg: Leg,
     addr: TransportAddress = .{},
-    /// Native identity (kagura stream + band the egress frame carries).
+    /// Native identity (cadence stream + band the egress frame carries).
     stream_id: u32 = 0,
-    band_id: u8 = kagura_frame.MEDIA_BAND_FLOOR,
+    band_id: u8 = cadence_frame.MEDIA_BAND_FLOOR,
     /// WebRTC identity (RTP SSRC stamped on the egress packet).
     ssrc: u32 = 0,
     /// Participant-advertised codec capabilities. Empty means unknown; the bridge
@@ -136,7 +136,7 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
         members: [max_participants]Member = undefined,
         len: usize = 0,
         ptmap: PtMap = .{},
-        session: kakehashi_session.Session(max_participants) = .{},
+        session: causeway_session.Session(max_participants) = .{},
         ssrcs: ssrc_map_mod.SsrcMap(max_participants) = .{},
         codec_state: CodecState = .unknown,
         common_codec: ?Codec = null,
@@ -244,7 +244,7 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
         fn crossTargetsForParticipant(self: *Self, from_leg: Leg, from_participant: ?u64, out: []Member) usize {
             const other: Leg = if (from_leg == .native) .webrtc else .native;
             if (from_participant) |pid| {
-                var egress: [max_participants]kakehashi_session.Egress = undefined;
+                var egress: [max_participants]causeway_session.Egress = undefined;
                 const en = self.session.forwardTargets(pid, &egress);
                 var n: usize = 0;
                 for (egress[0..en]) |target| {
@@ -259,38 +259,38 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
             return self.crossTargets(from_leg, "", out);
         }
 
-        /// Rewrap a native kagura `datagram` ONCE (keeping the source publisher's
+        /// Rewrap a native cadence `datagram` ONCE (keeping the source publisher's
         /// stream_id as the RTP ssrc, so receivers can demux) and send the same
         /// RTP packet to each WebRTC member of the call. Header-only; opaque
         /// payload shared verbatim. The `send` callback resolves each target's
         /// live address.
         pub fn fanoutNativeToWebrtc(self: *Self, datagram: []const u8, send_ctx: *anyopaque, send: SendFn) void {
-            const view = kagura_frame.decode(datagram) catch return;
-            const bf = kakehashi.fromNative(view);
+            const view = cadence_frame.decode(datagram) catch return;
+            const bf = causeway.fromNative(view);
             if (!self.codecAllowed(bf.codec)) return;
             var targets: [max_participants]Member = undefined;
             const n = self.crossTargetsForParticipant(.native, self.ssrcs.participantForStream(view.stream_id), &targets);
             if (n == 0) return;
             const ssrc = self.ssrcs.ssrcForStream(view.stream_id) orelse view.stream_id;
             var scratch: [max_rewrap]u8 = undefined;
-            const rtp = kakehashi.toRtp(bf, &self.ptmap, ssrc, &scratch) catch return;
+            const rtp = causeway.toRtp(bf, &self.ptmap, ssrc, &scratch) catch return;
             for (targets[0..n]) |*m| send(send_ctx, m, rtp);
         }
 
-        /// Rewrap an `rtp` packet ONCE to a native kagura datagram (keeping the
+        /// Rewrap an `rtp` packet ONCE to a native cadence datagram (keeping the
         /// source ssrc as the native stream_id) and send to each native member.
         /// Used by the WebRTC relay to bridge to native peers.
         pub fn fanoutWebrtcToNative(self: *Self, rtp: []const u8, keyframe_hint: bool, send_ctx: *anyopaque, send: SendFn) void {
             const dh = rtp_profile.decodeHeader(rtp) catch return;
-            const bf = kakehashi.fromRtp(rtp, &self.ptmap, keyframe_hint) catch return;
+            const bf = causeway.fromRtp(rtp, &self.ptmap, keyframe_hint) catch return;
             if (!self.codecAllowed(bf.codec)) return;
             var targets: [max_participants]Member = undefined;
             const n = self.crossTargetsForParticipant(.webrtc, self.ssrcs.participantForSsrc(dh.header.ssrc), &targets);
             if (n == 0) return;
             const stream_id = self.ssrcs.streamForSsrc(dh.header.ssrc) orelse dh.header.ssrc;
-            const nf = kakehashi.toNative(bf, kagura_frame.MEDIA_BAND_FLOOR, stream_id);
+            const nf = causeway.toNative(bf, cadence_frame.MEDIA_BAND_FLOOR, stream_id);
             var scratch: [max_rewrap]u8 = undefined;
-            const len = kagura_frame.encode(nf, &scratch) catch return;
+            const len = cadence_frame.encode(nf, &scratch) catch return;
             for (targets[0..n]) |*m| send(send_ctx, m, scratch[0..len]);
         }
 
@@ -391,19 +391,19 @@ pub fn ChannelBridge(comptime max_participants: usize) type {
 }
 
 // ---------------------------------------------------------------------------
-// Datagram-level rewrap (reuses kakehashi; payload is borrowed/opaque).
+// Datagram-level rewrap (reuses causeway; payload is borrowed/opaque).
 // ---------------------------------------------------------------------------
 
-/// Rewrap a native kagura datagram as an RTP packet for a WebRTC target
+/// Rewrap a native cadence datagram as an RTP packet for a WebRTC target
 /// (`ssrc`). Header-only: the codec payload is copied verbatim. Returns the RTP
 /// bytes in `out`.
 pub fn nativeDatagramToRtp(datagram: []const u8, map: *const PtMap, ssrc: u32, out: []u8) Error![]const u8 {
-    const view = try kagura_frame.decode(datagram);
-    const bf = kakehashi.fromNative(view);
-    return kakehashi.toRtp(bf, map, ssrc, out);
+    const view = try cadence_frame.decode(datagram);
+    const bf = causeway.fromNative(view);
+    return causeway.toRtp(bf, map, ssrc, out);
 }
 
-/// Rewrap an RTP packet as a native kagura datagram for a native target
+/// Rewrap an RTP packet as a native cadence datagram for a native target
 /// (`band_id`/`stream_id`). Header-only. Returns the encoded length in `out`.
 pub fn rtpToNativeDatagram(
     rtp: []const u8,
@@ -413,13 +413,13 @@ pub fn rtpToNativeDatagram(
     keyframe_hint: bool,
     out: []u8,
 ) Error!usize {
-    const bf = try kakehashi.fromRtp(rtp, map, keyframe_hint);
-    const nf = kakehashi.toNative(bf, band_id, stream_id);
-    return kagura_frame.encode(nf, out);
+    const bf = try causeway.fromRtp(rtp, map, keyframe_hint);
+    const nf = causeway.toNative(bf, band_id, stream_id);
+    return cadence_frame.encode(nf, out);
 }
 
 // ---------------------------------------------------------------------------
-// Tests (run under the unified build; transitively imports kagura/rtp_profile,
+// Tests (run under the unified build; transitively imports cadence/rtp_profile,
 // so not standalone `zig test`-able — expected).
 // ---------------------------------------------------------------------------
 
@@ -521,24 +521,24 @@ const FeedbackCaptureCtx = struct {
     }
 };
 
-test "fanout gates cross-leg frames on the shared Kakehashi codec" {
+test "fanout gates cross-leg frames on the shared Causeway codec" {
     var br = ChannelBridge(4).init();
     var native = Member{ .leg = .native, .stream_id = 7 };
-    native.setCodecs(&.{.kaguravox});
+    native.setCodecs(&.{.cadencevox});
     var webrtc = Member{ .leg = .webrtc, .ssrc = 0xCAFE };
-    webrtc.setCodecs(&.{.kaguravis});
+    webrtc.setCodecs(&.{.cadencevis});
     try br.register("alice", native);
     try br.register("mob", webrtc);
     try testing.expect(!br.transcodeFree());
 
     var src: [128]u8 = undefined;
-    const slen = try kagura_frame.encode(.{
-        .band_id = kagura_frame.MEDIA_BAND_FLOOR,
+    const slen = try cadence_frame.encode(.{
+        .band_id = cadence_frame.MEDIA_BAND_FLOOR,
         .stream_id = 7,
         .sequence = 1,
         .timestamp = 1,
         .keyframe = false,
-        .codec = .kaguravox_audio,
+        .codec = .cadencevox_audio,
         .payload = "audio",
     }, &src);
 
@@ -546,7 +546,7 @@ test "fanout gates cross-leg frames on the shared Kakehashi codec" {
     br.fanoutNativeToWebrtc(src[0..slen], &ctx, CountSendCtx.send);
     try testing.expectEqual(@as(usize, 0), ctx.count);
 
-    webrtc.setCodecs(&.{ .kaguravox, .kaguravis });
+    webrtc.setCodecs(&.{ .cadencevox, .cadencevis });
     try br.register("mob", webrtc);
     try testing.expect(br.transcodeFree());
     br.fanoutNativeToWebrtc(src[0..slen], &ctx, CountSendCtx.send);
@@ -556,20 +556,20 @@ test "fanout gates cross-leg frames on the shared Kakehashi codec" {
 test "fanout translates native stream id to RTP ssrc through ssrc_map" {
     var br = ChannelBridge(4).init();
     var native = Member{ .leg = .native, .stream_id = 7, .ssrc = 0xA111_A111 };
-    native.setCodecs(&.{.kaguravox});
+    native.setCodecs(&.{.cadencevox});
     var webrtc = Member{ .leg = .webrtc, .stream_id = 80, .ssrc = 0xB222_B222 };
-    webrtc.setCodecs(&.{.kaguravox});
+    webrtc.setCodecs(&.{.cadencevox});
     try br.register("alice", native);
     try br.register("mob", webrtc);
 
     var src: [128]u8 = undefined;
-    const slen = try kagura_frame.encode(.{
-        .band_id = kagura_frame.MEDIA_BAND_FLOOR,
+    const slen = try cadence_frame.encode(.{
+        .band_id = cadence_frame.MEDIA_BAND_FLOOR,
         .stream_id = 7,
         .sequence = 1,
         .timestamp = 960,
         .keyframe = false,
-        .codec = .kaguravox_audio,
+        .codec = .cadencevox_audio,
         .payload = "audio",
     }, &src);
 
@@ -583,49 +583,49 @@ test "fanout translates native stream id to RTP ssrc through ssrc_map" {
 test "fanout translates RTP ssrc to native stream id through ssrc_map" {
     var br = ChannelBridge(4).init();
     var native = Member{ .leg = .native, .stream_id = 7, .ssrc = 0xA111_A111 };
-    native.setCodecs(&.{.kaguravox});
+    native.setCodecs(&.{.cadencevox});
     var webrtc = Member{ .leg = .webrtc, .stream_id = 80, .ssrc = 0xB222_B222 };
-    webrtc.setCodecs(&.{.kaguravox});
+    webrtc.setCodecs(&.{.cadencevox});
     try br.register("alice", native);
     try br.register("mob", webrtc);
 
-    const bf = kakehashi.BridgeFrame{
-        .codec = .kaguravox,
+    const bf = causeway.BridgeFrame{
+        .codec = .cadencevox,
         .timestamp = 960,
         .sequence = 1,
         .keyframe = false,
         .payload = "audio",
     };
     var rtp_buf: [128]u8 = undefined;
-    const rtp = try kakehashi.toRtp(bf, &br.ptmap, 0xB222_B222, &rtp_buf);
+    const rtp = try causeway.toRtp(bf, &br.ptmap, 0xB222_B222, &rtp_buf);
 
     var ctx = CaptureSendCtx{};
     br.fanoutWebrtcToNative(rtp, false, &ctx, CaptureSendCtx.send);
     try testing.expectEqual(@as(usize, 1), ctx.count);
-    const native_frame = try kagura_frame.decode(ctx.written());
+    const native_frame = try cadence_frame.decode(ctx.written());
     try testing.expectEqual(@as(u32, 80), native_frame.stream_id);
-    try testing.expectEqual(kagura_frame.CodecTag.kaguravox_audio, native_frame.codec);
+    try testing.expectEqual(cadence_frame.CodecTag.cadencevox_audio, native_frame.codec);
 }
 
-test "fanout honors kakehashi_session connected target policy" {
+test "fanout honors causeway_session connected target policy" {
     var br = ChannelBridge(4).init();
     var native = Member{ .leg = .native, .stream_id = 7, .ssrc = 0xA111_A111 };
-    native.setCodecs(&.{.kaguravox});
+    native.setCodecs(&.{.cadencevox});
     var webrtc = Member{ .leg = .webrtc, .stream_id = 80, .ssrc = 0xB222_B222 };
-    webrtc.setCodecs(&.{.kaguravox});
+    webrtc.setCodecs(&.{.cadencevox});
     try br.register("alice", native);
     try br.register("mob", webrtc);
 
     br.session.get(memberStableId("mob")).?.connected = false;
 
     var src: [128]u8 = undefined;
-    const slen = try kagura_frame.encode(.{
-        .band_id = kagura_frame.MEDIA_BAND_FLOOR,
+    const slen = try cadence_frame.encode(.{
+        .band_id = cadence_frame.MEDIA_BAND_FLOOR,
         .stream_id = 7,
         .sequence = 1,
         .timestamp = 960,
         .keyframe = false,
-        .codec = .kaguravox_audio,
+        .codec = .cadencevox_audio,
         .payload = "audio",
     }, &src);
 
@@ -637,9 +637,9 @@ test "fanout honors kakehashi_session connected target policy" {
 test "feedback translates WebRTC PLI to native keyframe request" {
     var br = ChannelBridge(4).init();
     var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
-    native.setCodecs(&.{.kaguravis});
+    native.setCodecs(&.{.cadencevis});
     var webrtc = Member{ .leg = .webrtc, .stream_id = 200, .ssrc = 0xB200 };
-    webrtc.setCodecs(&.{.kaguravis});
+    webrtc.setCodecs(&.{.cadencevis});
     try br.register("alice", native);
     try br.register("mob", webrtc);
 
@@ -661,9 +661,9 @@ test "feedback translates WebRTC PLI to native keyframe request" {
 test "RTCP compound feedback (RR then PLI) translates to a native keyframe request" {
     var br = ChannelBridge(4).init();
     var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
-    native.setCodecs(&.{.kaguravis});
+    native.setCodecs(&.{.cadencevis});
     var webrtc = Member{ .leg = .webrtc, .stream_id = 200, .ssrc = 0xB200 };
-    webrtc.setCodecs(&.{.kaguravis});
+    webrtc.setCodecs(&.{.cadencevis});
     try br.register("alice", native);
     try br.register("mob", webrtc);
 
@@ -697,9 +697,9 @@ test "RTCP compound feedback (RR then PLI) translates to a native keyframe reque
 test "feedback translates WebRTC NACK to native NACK" {
     var br = ChannelBridge(4).init();
     var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
-    native.setCodecs(&.{.kaguravis});
+    native.setCodecs(&.{.cadencevis});
     var webrtc = Member{ .leg = .webrtc, .stream_id = 200, .ssrc = 0xB200 };
-    webrtc.setCodecs(&.{.kaguravis});
+    webrtc.setCodecs(&.{.cadencevis});
     try br.register("alice", native);
     try br.register("mob", webrtc);
 
@@ -722,9 +722,9 @@ test "feedback translates WebRTC NACK to native NACK" {
 test "feedback translates authenticated native keyframe request to WebRTC PLI" {
     var br = ChannelBridge(4).init();
     var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
-    native.setCodecs(&.{.kaguravis});
+    native.setCodecs(&.{.cadencevis});
     var webrtc = Member{ .leg = .webrtc, .stream_id = 0xB200, .ssrc = 0xB200 };
-    webrtc.setCodecs(&.{.kaguravis});
+    webrtc.setCodecs(&.{.cadencevis});
     try br.register("alice", native);
     try br.register("mob", webrtc);
 
@@ -746,9 +746,9 @@ test "feedback translates authenticated native keyframe request to WebRTC PLI" {
 test "feedback translates authenticated native NACK to WebRTC NACK" {
     var br = ChannelBridge(4).init();
     var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
-    native.setCodecs(&.{.kaguravis});
+    native.setCodecs(&.{.cadencevis});
     var webrtc = Member{ .leg = .webrtc, .stream_id = 0xB200, .ssrc = 0xB200 };
-    webrtc.setCodecs(&.{.kaguravis});
+    webrtc.setCodecs(&.{.cadencevis});
     try br.register("alice", native);
     try br.register("mob", webrtc);
 
@@ -772,9 +772,9 @@ test "feedback translates authenticated native NACK to WebRTC NACK" {
 test "feedback rejects native NACK sequences outside RTP range" {
     var br = ChannelBridge(4).init();
     var native = Member{ .leg = .native, .stream_id = 100, .ssrc = 0xA100 };
-    native.setCodecs(&.{.kaguravis});
+    native.setCodecs(&.{.cadencevis});
     var webrtc = Member{ .leg = .webrtc, .stream_id = 0xB200, .ssrc = 0xB200 };
-    webrtc.setCodecs(&.{.kaguravis});
+    webrtc.setCodecs(&.{.cadencevis});
     try br.register("alice", native);
     try br.register("mob", webrtc);
 
@@ -788,15 +788,15 @@ test "feedback rejects native NACK sequences outside RTP range" {
 test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" {
     var map = defaultPtMap();
 
-    // Encode an kaguravis (video) native frame.
+    // Encode an cadencevis (video) native frame.
     var src: [128]u8 = undefined;
-    const slen = try kagura_frame.encode(.{
-        .band_id = kagura_frame.MEDIA_BAND_FLOOR + 2,
+    const slen = try cadence_frame.encode(.{
+        .band_id = cadence_frame.MEDIA_BAND_FLOOR + 2,
         .stream_id = 7,
         .sequence = 1234,
         .timestamp = 90000,
         .keyframe = true,
-        .codec = .kaguravis_video,
+        .codec = .cadencevis_video,
         .payload = "video-payload",
     }, &src);
 
@@ -806,10 +806,10 @@ test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" 
 
     // RTP -> native (for a native peer's band/stream).
     var back: [256]u8 = undefined;
-    const blen = try rtpToNativeDatagram(rtp, &map, kagura_frame.MEDIA_BAND_FLOOR + 2, 7, true, &back);
-    const view = try kagura_frame.decode(back[0..blen]);
+    const blen = try rtpToNativeDatagram(rtp, &map, cadence_frame.MEDIA_BAND_FLOOR + 2, 7, true, &back);
+    const view = try cadence_frame.decode(back[0..blen]);
 
-    try testing.expectEqual(kagura_frame.CodecTag.kaguravis_video, view.codec);
+    try testing.expectEqual(cadence_frame.CodecTag.cadencevis_video, view.codec);
     try testing.expectEqualStrings("video-payload", view.payload);
     try testing.expect(view.keyframe);
     try testing.expectEqual(@as(u32, 1234 & 0xFFFF), view.sequence); // RTP seq is 16-bit
@@ -818,13 +818,13 @@ test "rewrap native datagram -> RTP -> native preserves codec/payload/keyframe" 
 test "rewrap rejects an unknown payload type" {
     var empty = PtMap{};
     var src: [64]u8 = undefined;
-    const slen = try kagura_frame.encode(.{
-        .band_id = kagura_frame.MEDIA_BAND_FLOOR,
+    const slen = try cadence_frame.encode(.{
+        .band_id = cadence_frame.MEDIA_BAND_FLOOR,
         .stream_id = 1,
         .sequence = 1,
         .timestamp = 1,
         .keyframe = false,
-        .codec = .kaguravox_audio,
+        .codec = .cadencevox_audio,
         .payload = "x",
     }, &src);
     var out: [128]u8 = undefined;

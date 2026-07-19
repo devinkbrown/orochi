@@ -19,8 +19,8 @@ const std = @import("std");
 
 const attachment_id_mod = @import("../daemon/attachment_id.zig");
 const sign = @import("../crypto/sign.zig");
-const mesh_clock = @import("../substrate/suimyaku/mesh_clock.zig");
-const signed_frame = @import("../substrate/suimyaku/signed_frame.zig");
+const mesh_clock = @import("../substrate/undertow/mesh_clock.zig");
+const signed_frame = @import("../substrate/undertow/signed_frame.zig");
 
 pub const GroupToken = attachment_id_mod.SessionToken;
 pub const AttachmentId = attachment_id_mod.AttachmentId;

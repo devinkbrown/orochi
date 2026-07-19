@@ -29,7 +29,7 @@ Most of these commands are registered by `user.query` (`src/daemon/modules/user_
 ## LUSERS
 
 - Syntax: `LUSERS`
-- Description: Returns network and local population counters. Registered local users come from the shared world nick registry, while global user totals include established Suimyaku peer route-table users.
+- Description: Returns network and local population counters. Registered local users come from the shared world nick registry, while global user totals include established Undertow peer route-table users.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: `RPL_LUSERCLIENT 251`, `RPL_LUSEROP 252`, `RPL_LUSERUNKNOWN 253`, `RPL_LUSERCHANNELS 254`, `RPL_LUSERME 255`, `RPL_STATSCONN 250`, `RPL_LOCALUSERS 265`, `RPL_GLOBALUSERS 266`.

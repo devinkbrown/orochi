@@ -104,7 +104,7 @@ pub const MediaPlane = struct {
     csprng: std.Random.DefaultCsprng,
     /// Optional cross-leg sink: after relaying an RTP frame to WebRTC peers, the
     /// pump hands it here to also reach the channel's native members (rewrapped to
-    /// kagura). Null = no native members / no bridging.
+    /// cadence). Null = no native members / no bridging.
     cross: ?media_bridge.RtpCrossSink = null,
     /// Opt-in DTLS-SRTP termination (RFC 5764). Set before `start`; when false
     /// the pump has no DTLS demux branch and is byte-identical to today.
@@ -1239,7 +1239,7 @@ test "MediaPlane e2e: DTLS-SRTP media forwards A->B, decrypted then re-encrypted
 
     // A publishes an SRTP frame protected with A's client-write context.
     const a_out = srtp.deriveSessionKeys(keysA.clientMaster(), keysA.clientSalt());
-    const rtp = [_]u8{ 0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64, 0xA1, 0xA1, 0xA1, 0xA1 } ++ "kaguravox-voice".*;
+    const rtp = [_]u8{ 0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x64, 0xA1, 0xA1, 0xA1, 0xA1 } ++ "cadencevox-voice".*;
     var wire_buf: [rtp.len + srtp.auth_tag_len]u8 = undefined;
     const wireA = try srtp.protect(a_out, 0, &rtp, &wire_buf);
     a.sendTo(server_addr, wireA);

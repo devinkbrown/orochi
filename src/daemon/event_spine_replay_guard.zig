@@ -209,7 +209,7 @@ fn writeU32(bytes: *[4]u8, value: u32) void {
 
 const testing = std.testing;
 const sign = @import("../crypto/sign.zig");
-const mesh_clock = @import("../substrate/suimyaku/mesh_clock.zig");
+const mesh_clock = @import("../substrate/undertow/mesh_clock.zig");
 
 fn testEvent(
     kp: *const sign.KeyPair,

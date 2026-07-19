@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `yoroi ciphers` — enumerate what the Yoroi TLS stack actually negotiates.
+//! `armor ciphers` — enumerate what the Armor TLS stack actually negotiates.
 //! Suites come straight from the hardened allow-list (src/crypto/tls.zig
 //! `isAllowed`), key-exchange groups from the client's real ClientHello offer
 //! (src/crypto/tls_client.zig:1250: x25519mlkem768, x25519, secp256r1), and
@@ -21,9 +21,9 @@ const Writer = common.Writer;
 
 pub fn usage(w: *Writer) Writer.Error!void {
     try w.writeAll(
-        \\usage: yoroi ciphers
+        \\usage: armor ciphers
         \\  lists the TLS 1.3/1.2 cipher suites, key-exchange groups, and
-        \\  signature schemes the Yoroi stack supports (the hardened allow-list)
+        \\  signature schemes the Armor stack supports (the hardened allow-list)
         \\
     );
 }
@@ -63,7 +63,7 @@ pub fn run(out: *Writer) !void {
 
 const testing = std.testing;
 
-test "yoroicli ciphers reflects the hardened allow-list, no legacy suites" {
+test "armorcli ciphers reflects the hardened allow-list, no legacy suites" {
     var aw = Writer.Allocating.init(testing.allocator);
     defer aw.deinit();
     try run(&aw.writer);

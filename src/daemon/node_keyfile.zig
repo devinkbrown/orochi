@@ -4,7 +4,7 @@
 //! Persisted node identity seed: secured S2S on by default.
 //!
 //! When the operator configures no `[node] secret_key`, the daemon still turns
-//! the PQ-secured Tsumugi mesh on: it loads the 32-byte Ed25519 seed from a
+//! the PQ-secured Mooring mesh on: it loads the 32-byte Ed25519 seed from a
 //! keyfile next to the config (`orochi-node.key`), generating a fresh random
 //! seed and persisting it (owner-only, 0600) on first boot. An explicitly
 //! configured `secret_key` always wins and never touches the keyfile.

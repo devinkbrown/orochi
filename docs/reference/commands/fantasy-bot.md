@@ -71,7 +71,7 @@ or per-call with `!weather <place>`.
 
 ## News updater (full feed coverage)
 
-The in-daemon TLS 1.3 stack (Yoroi) verifies ECDSA and RSA leaf certificates, so
+The in-daemon TLS 1.3 stack (Armor) verifies ECDSA and RSA leaf certificates, so
 it reaches the great majority of feeds directly; a TLS-1.2-only host is the main
 exception. For guaranteed full coverage regardless, set `[geo] news_cache_dir`
 and run the bundled key-free updater from cron. The updater uses `curl` with the

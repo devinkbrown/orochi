@@ -16,7 +16,7 @@ const std = @import("std");
 
 const sign = @import("../crypto/sign.zig");
 const node_short_id = @import("../crypto/node_short_id.zig");
-const mesh_clock = @import("../substrate/suimyaku/mesh_clock.zig");
+const mesh_clock = @import("../substrate/undertow/mesh_clock.zig");
 
 pub const max_origin_len: usize = 128;
 /// Subject used by per-category Event Spine glob filters. This matches the

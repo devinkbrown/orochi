@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `yoroi` CLI namespace root — one small module per subcommand, each a thin
-//! front-end over the Yoroi crypto substrate (src/crypto/*, src/proto/*).
+//! `armor` CLI namespace root — one small module per subcommand, each a thin
+//! front-end over the Armor crypto substrate (src/crypto/*, src/proto/*).
 //! No crypto is implemented under src/cli/.
 
 const std = @import("std");

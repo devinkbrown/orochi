@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `yoroi rand` — cryptographically-random bytes from the substrate DRBG
+//! `armor rand` — cryptographically-random bytes from the substrate DRBG
 //! (src/crypto/random.zig `Drbg`, OS-entropy seeded ChaCha20). Output raw
 //! (openssl default), `-hex`, or `-base64`.
 
@@ -27,7 +27,7 @@ pub const Options = struct {
 
 pub fn usage(w: *Writer) Writer.Error!void {
     try w.writeAll(
-        \\usage: yoroi rand [-hex|-base64] [-out <path>] <num>
+        \\usage: armor rand [-hex|-base64] [-out <path>] <num>
         \\  <num>        number of random bytes to emit (1..16MiB)
         \\  -hex         lowercase hex output
         \\  -base64      standard base64 output
@@ -98,7 +98,7 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
 
 const testing = std.testing;
 
-test "yoroicli rand emits the requested length in each encoding" {
+test "armorcli rand emits the requested length in each encoding" {
     const gpa = testing.allocator;
     var aw = Writer.Allocating.init(gpa);
     defer aw.deinit();
@@ -116,7 +116,7 @@ test "yoroicli rand emits the requested length in each encoding" {
     try testing.expectEqual(@as(usize, 41), aw.written().len); // ceil(30/3)*4 + newline
 }
 
-test "yoroicli rand two draws differ (DRBG is live, not a constant)" {
+test "armorcli rand two draws differ (DRBG is live, not a constant)" {
     const gpa = testing.allocator;
     var a = Writer.Allocating.init(gpa);
     defer a.deinit();
@@ -127,7 +127,7 @@ test "yoroicli rand two draws differ (DRBG is live, not a constant)" {
     try testing.expect(!std.mem.eql(u8, a.written(), b.written()));
 }
 
-test "yoroicli rand arg validation" {
+test "armorcli rand arg validation" {
     try testing.expectError(error.Usage, parseArgs(&.{}));
     try testing.expectError(error.Usage, parseArgs(&.{"0"}));
     try testing.expectError(error.Usage, parseArgs(&.{"abc"}));

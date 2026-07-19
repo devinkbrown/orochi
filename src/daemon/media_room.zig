@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Per-channel media rooms — the daemon-side manager that maps an IRC channel
-//! to a Suimyaku media Session (the SFU participant model). This is the control
+//! to a Undertow media Session (the SFU participant model). This is the control
 //! plane only: it tracks who is in a call and what they publish (voice/video/
 //! screen) plus mute/speaking state. The media bytes themselves flow over the
 //! transport substrate, not through here.
@@ -10,7 +10,7 @@
 //! Rooms are created on first join and pruned when empty. Each room is heap-
 //! allocated (the Session value is large) and keyed by an owned channel name.
 const std = @import("std");
-const media = @import("../substrate/suimyaku/media.zig");
+const media = @import("../substrate/undertow/media.zig");
 const toml = @import("../proto/toml.zig");
 const sdp = @import("../proto/sdp.zig");
 
@@ -100,7 +100,7 @@ pub const MediaRooms = struct {
     profiles: std.StringHashMap(CallProfile),
     /// Per-(channel,participant) advertised codec/FEC capability set. This is
     /// distinct from the channel profile: it records what each participant can
-    /// receive so Kakehashi can keep the call transcode-free.
+    /// receive so Causeway can keep the call transcode-free.
     participant_profiles: std.StringHashMap(CallProfile),
 
     pub fn init(allocator: std.mem.Allocator) MediaRooms {
@@ -446,7 +446,7 @@ test "upgrade continuity: MediaRooms is ready only without live control state" {
     try testing.expect(m.upgradeContinuityReady());
 
     try m.join("#c", "alice", .voice);
-    const codecs = [_]sdp.Codec{.{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 }};
+    const codecs = [_]sdp.Codec{.{ .tag = .cadencevox, .clock_rate = 48000, .params = 0 }};
     try m.setProfile("#c", &codecs, .{ .scheme = .none, .redundancy = 0 });
     try m.setParticipantProfile("#c", "alice", &codecs, .{ .scheme = .none, .redundancy = 0 });
     try m.setBreakout("#c", "alice", "stage");
@@ -463,14 +463,14 @@ test "call profile persists then clears when the call ends" {
     defer m.deinit();
     try testing.expect(m.profileOf("#c") == null);
     try m.join("#c", "alice", .voice);
-    const codecs = [_]sdp.Codec{.{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 }};
+    const codecs = [_]sdp.Codec{.{ .tag = .cadencevox, .clock_rate = 48000, .params = 0 }};
     try m.setProfile("#c", &codecs, .{ .scheme = .rs_block, .redundancy = 1 });
     const prof = m.profileOf("#c").?;
     try testing.expectEqual(@as(usize, 1), prof.slice().len);
-    try testing.expectEqual(sdp.CodecTag.kaguravox, prof.slice()[0].tag);
+    try testing.expectEqual(sdp.CodecTag.cadencevox, prof.slice()[0].tag);
     try testing.expectEqual(sdp.FecScheme.rs_block, prof.fec.scheme);
     // reassigning overwrites in place (no leak)
-    const codecs2 = [_]sdp.Codec{ .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 }, .{ .tag = .kaguravis, .clock_rate = 90000, .params = 0 } };
+    const codecs2 = [_]sdp.Codec{ .{ .tag = .cadencevox, .clock_rate = 48000, .params = 0 }, .{ .tag = .cadencevis, .clock_rate = 90000, .params = 0 } };
     try m.setProfile("#c", &codecs2, .{ .scheme = .none, .redundancy = 0 });
     try testing.expectEqual(@as(usize, 2), m.profileOf("#c").?.slice().len);
     try testing.expect(m.leaveAll("#c", "alice"));
@@ -482,13 +482,13 @@ test "participant codec profile stores and clears on leave" {
     defer m.deinit();
     try m.join("#c", "alice", .voice);
     const codecs = [_]sdp.Codec{
-        .{ .tag = .kaguravox, .clock_rate = 48000, .params = 0 },
-        .{ .tag = .kaguravis, .clock_rate = 90000, .params = 0 },
+        .{ .tag = .cadencevox, .clock_rate = 48000, .params = 0 },
+        .{ .tag = .cadencevis, .clock_rate = 90000, .params = 0 },
     };
     try m.setParticipantProfile("#c", "alice", &codecs, .{ .scheme = .rs_block, .redundancy = 1 });
     const prof = m.participantProfileOf("#c", "alice").?;
     try testing.expectEqual(@as(usize, 2), prof.slice().len);
-    try testing.expectEqual(sdp.CodecTag.kaguravox, prof.slice()[0].tag);
+    try testing.expectEqual(sdp.CodecTag.cadencevox, prof.slice()[0].tag);
     try testing.expectEqual(sdp.FecScheme.rs_block, prof.fec.scheme);
     try testing.expect(m.leaveAll("#c", "alice"));
     try testing.expect(m.participantProfileOf("#c", "alice") == null);

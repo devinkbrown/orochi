@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Length-prefixed S2S wire frames for Suimyaku mesh links.
+//! Length-prefixed S2S wire frames for Undertow mesh links.
 //!
 //! The frame header is exactly five bytes:
 //!   * u8 frame type tag
@@ -76,7 +76,7 @@ pub const FrameType = enum(u8) {
     /// Targeted cross-mesh operator KILL: the owning node disconnects its local
     /// `target` on behalf of operator `killer` who issued it on `origin_server`.
     /// A one-shot COMMAND (not stored); the killer's node already enforced the
-    /// `client_kill` privilege and signs the frame with its Tsumugi identity.
+    /// `client_kill` privilege and signs the frame with its Mooring identity.
     /// Carries {origin_server, killer, target, reason}.
     KILL = 0x16,
     /// Network-wide `mesh`-scope WARD (network-ban) convergence: an add or remove
@@ -333,7 +333,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .HANDSHAKE, .token = "HANDSHAKE", .family = .handshake, .auth = .unsigned, .summary = "Exchanges node id, epoch, server name, description, and negotiated S2S capabilities." },
     .{ .frame_type = .BURST, .token = "BURST", .family = .crdt, .auth = .unsigned, .summary = "Initial serialized channel CRDT state burst." },
     .{ .frame_type = .DELTA, .token = "DELTA", .family = .crdt, .auth = .unsigned, .summary = "Incremental channel CRDT delta." },
-    .{ .frame_type = .GOSSIP, .token = "GOSSIP", .family = .membership, .auth = .unsigned, .summary = "Sazanami membership and suspicion gossip payload." },
+    .{ .frame_type = .GOSSIP, .token = "GOSSIP", .family = .membership, .auth = .unsigned, .summary = "Ripple membership and suspicion gossip payload." },
     .{ .frame_type = .PING, .token = "PING", .family = .control, .auth = .unsigned, .summary = "Liveness probe; answered with a matching PONG payload." },
     .{ .frame_type = .PONG, .token = "PONG", .family = .control, .auth = .unsigned, .summary = "Liveness probe response." },
     .{ .frame_type = .QUIT, .token = "QUIT", .family = .control, .auth = .unsigned, .summary = "Remote peer close notification." },
@@ -504,7 +504,7 @@ test "encode/decode round-trip each type" {
 
     inline for (frame_catalog) |spec| {
         const frame_type = spec.frame_type;
-        const payload = "suimyaku s2s payload";
+        const payload = "undertow s2s payload";
         var encoded: [header_len + payload.len]u8 = undefined;
         const bytes = try encode(frame_type, payload, &encoded);
 

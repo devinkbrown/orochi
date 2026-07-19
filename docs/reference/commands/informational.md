@@ -95,7 +95,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 ## LINKS
 
 - Syntax: `LINKS`
-- Description: Lists this server and each distinct established Suimyaku S2S peer as a one-hop neighbour, using each peer's handshake-gossiped description when available.
+- Description: Lists this server and each distinct established Undertow S2S peer as a one-hop neighbour, using each peer's handshake-gossiped description when available.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: `RPL_LINKS 364`, `RPL_ENDOFLINKS 365`.
@@ -106,7 +106,7 @@ The `query.info` module registers the stateless server-information commands (`sr
 ## MAP
 
 - Syntax: `MAP`
-- Description: Returns a compact Suimyaku mesh topology: this server with its local user count and each published established peer as a child row.
+- Description: Returns a compact Undertow mesh topology: this server with its local user count and each published established peer as a child row.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: `RPL_MAP 015`, `RPL_MAPEND 017`.

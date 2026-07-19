@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Daemon-owned native media transport: the live UDP leg for Orochi's own
-//! codec (KaguraVox/KaguraVis). Mirrors `media_plane.MediaPlane` (the WebRTC/UDP leg) but
-//! carries `kagura_frame` datagrams instead of RTP, and forwards them through a
+//! codec (CadenceVox/CadenceVis). Mirrors `media_plane.MediaPlane` (the WebRTC/UDP leg) but
+//! carries `cadence_frame` datagrams instead of RTP, and forwards them through a
 //! per-channel `NativeMediaLink` (stream_id → publisher → recipients).
 //!
 //! Per-channel isolation: each media call (channel) has its own `NativeMediaLink`
@@ -12,7 +12,7 @@
 //! the right channel's link.
 //!
 //! The pump thread blocks on the socket (short recv timeout to observe the stop
-//! flag), and for each datagram that parses as an kagura frame: routes by
+//! flag), and for each datagram that parses as an cadence frame: routes by
 //! stream_id to the owning channel, learns the publisher's return address from
 //! the datagram origin, computes the SFU forward set, and resends the SAME opaque
 //! bytes to each recipient. The server NEVER encodes/decodes/transcodes — frames
@@ -21,7 +21,7 @@ const std = @import("std");
 const native_media_link = @import("native_media_link.zig");
 const media_bridge = @import("media_bridge.zig");
 const media_socket = @import("../substrate/media_socket.zig");
-const kagura_frame = @import("../substrate/kagura_frame.zig");
+const cadence_frame = @import("../substrate/cadence_frame.zig");
 const native_feedback = @import("../substrate/native_feedback.zig");
 
 pub const MediaSocket = media_socket.MediaSocket;
@@ -34,7 +34,7 @@ pub const max_datagram = media_socket.max_datagram;
 
 /// Max participants per native call (inline forward fan-out bound).
 ///
-/// The native (KaguraVox/KaguraVis) leg is for point-to-point / small calls; group
+/// The native (CadenceVox/CadenceVis) leg is for point-to-point / small calls; group
 /// sessions go through the SFU `Room` (ceiling 256, pointer-indirected per room).
 /// This `Link` is stored BY VALUE in a rehashing map, so its inline ceiling stays
 /// at 64 to keep the per-entry size (and rehash memcpy cost) bounded; the
@@ -63,7 +63,7 @@ pub const NativeMediaTransport = struct {
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// Bound local UDP port (0 until started); advertised to native clients.
     port: u16 = 0,
-    /// Runtime cap for accepted kagura datagrams.
+    /// Runtime cap for accepted cadence datagrams.
     max_frame_bytes: usize = media_socket.max_datagram,
     /// Runtime cap reserved for upload-bearing media operations.
     max_upload_bytes: u64 = 16 * 1024 * 1024,
@@ -162,15 +162,15 @@ pub const NativeMediaTransport = struct {
         while (!self.stop_flag.load(.acquire)) {
             const sock = &(self.socket orelse return);
             const got = sock.recvFrom(&buf) orelse continue; // timeout/idle
-            // Require kagura framing so the port is not an open UDP reflector.
+            // Require cadence framing so the port is not an open UDP reflector.
             if (got.data.len > self.max_frame_bytes) continue;
             if (native_feedback.isEnvelope(got.data)) {
                 self.handleFeedback(got.from, got.data);
                 continue;
             }
-            if (got.data.len < kagura_frame.MIN_FRAME_WIRE_BYTES) continue;
-            const frame_bytes = kagura_frame.authenticatedFrameBytes(got.data) catch continue;
-            const view = kagura_frame.decode(frame_bytes) catch continue;
+            if (got.data.len < cadence_frame.MIN_FRAME_WIRE_BYTES) continue;
+            const frame_bytes = cadence_frame.authenticatedFrameBytes(got.data) catch continue;
+            const view = cadence_frame.decode(frame_bytes) catch continue;
 
             lockSpin(&self.mutex);
             var n: usize = 0;
@@ -184,7 +184,7 @@ pub const NativeMediaTransport = struct {
                         const auth_frame = self.authenticateDatagram(chan, participant, got.data) catch null;
                         if (auth_frame) |exact_frame| {
                             n = link.inboundFrom(exact_frame, got.from, &targets);
-                            forward_datagram = if (got.data.len == exact_frame.len + kagura_frame.MAC_TAG_BYTES) got.data else exact_frame;
+                            forward_datagram = if (got.data.len == exact_frame.len + cadence_frame.MAC_TAG_BYTES) got.data else exact_frame;
                             bridge_datagram = exact_frame;
                             // Copy the channel name out under the lock so the cross-leg
                             // sink can use it after we unlock (the key may be freed if the
@@ -242,7 +242,7 @@ pub const NativeMediaTransport = struct {
         // or short tag is dropped here, so it can never rebind the victim's
         // inbound-media return path. The lock is NOT held across openEnvelope.
         var key: [native_feedback.envelope_key_len]u8 = undefined;
-        kagura_frame.deriveNativeMediaMacKey(
+        cadence_frame.deriveNativeMediaMacKey(
             &self.mac_stream_key,
             channel_buf[0..channel_len],
             participant_buf[0..participant_len],
@@ -271,14 +271,14 @@ pub const NativeMediaTransport = struct {
         channel: []const u8,
         participant: []const u8,
         datagram: []const u8,
-    ) kagura_frame.MacError![]const u8 {
+    ) cadence_frame.MacError![]const u8 {
         if (!self.mac_key_configured) {
-            const exact_frame = try kagura_frame.authenticatedFrameBytes(datagram);
-            if (try kagura_frame.hasAuthenticationTag(datagram)) return error.BadTag;
+            const exact_frame = try cadence_frame.authenticatedFrameBytes(datagram);
+            if (try cadence_frame.hasAuthenticationTag(datagram)) return error.BadTag;
             if (self.require_mac) return error.MissingTag;
             return exact_frame;
         }
-        return kagura_frame.acceptNativeMediaMac(&self.mac_stream_key, channel, participant, datagram, self.require_mac);
+        return cadence_frame.acceptNativeMediaMac(&self.mac_stream_key, channel, participant, datagram, self.require_mac);
     }
 
     fn tagOutbound(
@@ -286,11 +286,11 @@ pub const NativeMediaTransport = struct {
         channel: []const u8,
         bytes: []const u8,
         out: []u8,
-    ) kagura_frame.MacError![]const u8 {
+    ) cadence_frame.MacError![]const u8 {
         if (!self.require_mac) return bytes;
         if (!self.mac_key_configured) return error.MissingTag;
 
-        const view = try kagura_frame.decode(bytes);
+        const view = try cadence_frame.decode(bytes);
         var participant_buf: [64]u8 = undefined;
         var participant_len: usize = 0;
         lockSpin(&self.mutex);
@@ -309,7 +309,7 @@ pub const NativeMediaTransport = struct {
         self.mutex.unlock();
         if (participant_len == 0) return error.MissingTag;
 
-        return kagura_frame.appendNativeMediaMac(
+        return cadence_frame.appendNativeMediaMac(
             &self.mac_stream_key,
             channel,
             participant_buf[0..participant_len],
@@ -354,7 +354,7 @@ pub const NativeMediaTransport = struct {
     /// Register/update a native participant in `channel` (MEDIA OFFER). `addr`
     /// may be a placeholder; the pump learns the real return path from the
     /// participant's first datagram. `stream_id` is what the publisher stamps
-    /// into its kagura frames (advertised back to the client).
+    /// into its cadence frames (advertised back to the client).
     pub fn register(
         self: *NativeMediaTransport,
         channel: []const u8,
@@ -406,7 +406,7 @@ pub const NativeMediaTransport = struct {
     }
 
     /// Send `bytes` to `dest` on the native socket. Used by the WebRTC relay's
-    /// cross-leg sink to deliver kagura-rewrapped frames to native peers.
+    /// cross-leg sink to deliver cadence-rewrapped frames to native peers.
     pub fn sendTo(self: *NativeMediaTransport, channel: []const u8, dest: TransportAddress, bytes: []const u8) void {
         if (self.socket) |*s| {
             var tagged_buf: [media_socket.max_datagram]u8 = undefined;
@@ -416,7 +416,7 @@ pub const NativeMediaTransport = struct {
     }
 
     /// Send a native control-plane feedback message to `dest`. This is not a
-    /// kagura media frame and must not pass through media-frame MAC tagging.
+    /// cadence media frame and must not pass through media-frame MAC tagging.
     pub fn sendFeedbackTo(self: *NativeMediaTransport, dest: TransportAddress, bytes: []const u8) void {
         if (self.socket) |*s| s.sendTo(dest, bytes);
     }
@@ -456,13 +456,13 @@ pub const NativeMediaTransport = struct {
 const testing = std.testing;
 
 fn opframe(stream_id: u32, buf: []u8) []const u8 {
-    const n = kagura_frame.encode(.{
-        .band_id = kagura_frame.MEDIA_BAND_FLOOR,
+    const n = cadence_frame.encode(.{
+        .band_id = cadence_frame.MEDIA_BAND_FLOOR,
         .stream_id = stream_id,
         .sequence = 1,
         .timestamp = 0,
         .keyframe = true,
-        .codec = .kaguravox_audio,
+        .codec = .cadencevox_audio,
         .payload = &[_]u8{ 0xDE, 0xAD, 0xBE, 0xEF },
     }, buf) catch unreachable;
     return buf[0..n];
@@ -471,14 +471,14 @@ fn opframe(stream_id: u32, buf: []u8) []const u8 {
 fn taggedOpframe(stream_id: u32, key: *const [16]u8, channel: []const u8, participant: []const u8, buf: []u8) []const u8 {
     var frame_buf: [64]u8 = undefined;
     const frame = opframe(stream_id, &frame_buf);
-    return kagura_frame.appendNativeMediaMac(key, channel, participant, frame, buf) catch unreachable;
+    return cadence_frame.appendNativeMediaMac(key, channel, participant, frame, buf) catch unreachable;
 }
 
 fn mkAddr(last: u8, port: u16) TransportAddress {
     return TransportAddress.fromBytes(&[_]u8{ 127, 0, 0, last }, port) catch unreachable;
 }
 
-test "NativeMediaTransport: pump learns sender + forwards an kagura frame to the receiver" {
+test "NativeMediaTransport: pump learns sender + forwards an cadence frame to the receiver" {
     var nmt = NativeMediaTransport.init(testing.allocator);
     defer nmt.deinit();
     try nmt.start(loopback_be, 0);
@@ -533,7 +533,7 @@ test "NativeMediaTransport: required MAC drops untagged and accepts valid tagged
 
     const tagged = taggedOpframe(100, &mac_key, "#secure", "alice", &fbuf);
     const exact_frame = try nmt.authenticateDatagram("#secure", "alice", tagged);
-    try testing.expectEqual(tagged.len - kagura_frame.MAC_TAG_BYTES, exact_frame.len);
+    try testing.expectEqual(tagged.len - cadence_frame.MAC_TAG_BYTES, exact_frame.len);
 
     const link = nmt.channels.getPtr("#secure").?;
     var out: [max_call_participants]TransportAddress = undefined;
@@ -611,13 +611,13 @@ test "NativeMediaTransport: setSelection drops higher layers over the wire" {
     var rbuf: [media_socket.max_datagram]u8 = undefined;
 
     // A spatial layer-1 (band floor+1) non-keyframe must be dropped for lowbw.
-    const hi = kagura_frame.encode(.{
-        .band_id = kagura_frame.MEDIA_BAND_FLOOR + 1,
+    const hi = cadence_frame.encode(.{
+        .band_id = cadence_frame.MEDIA_BAND_FLOOR + 1,
         .stream_id = 10,
         .sequence = 1,
         .timestamp = 0,
         .keyframe = false,
-        .codec = .kaguravis_video,
+        .codec = .cadencevis_video,
         .payload = &[_]u8{ 1, 2, 3 },
     }, &fbuf) catch unreachable;
     src.sendTo(server_addr, fbuf[0..hi]);
@@ -748,7 +748,7 @@ test "NativeMediaTransport: pump accepts authenticated native feedback envelope"
     try nmt.register("#call", "alice", .voice, 100, .{});
 
     var key: [native_feedback.envelope_key_len]u8 = undefined;
-    kagura_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
+    cadence_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
     defer std.crypto.secureZero(u8, key[0..]);
 
     var payload_buf: [32]u8 = undefined;
@@ -787,7 +787,7 @@ test "NativeMediaTransport: pump rejects native feedback with a bad tag" {
     try nmt.register("#call", "alice", .voice, 100, .{});
 
     var key: [native_feedback.envelope_key_len]u8 = undefined;
-    kagura_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
+    cadence_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
     defer std.crypto.secureZero(u8, key[0..]);
 
     var payload_buf: [32]u8 = undefined;
@@ -838,7 +838,7 @@ test "NativeMediaTransport: forged feedback with a bad tag does not rebind the v
 
     // Correct per-{channel,participant} key + a valid envelope, then corrupt the tag.
     var key: [native_feedback.envelope_key_len]u8 = undefined;
-    kagura_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
+    cadence_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
     defer std.crypto.secureZero(u8, key[0..]);
     var payload_buf: [32]u8 = undefined;
     const payload = try native_feedback.encodeKeyframeRequest(200, &payload_buf);
@@ -875,7 +875,7 @@ test "NativeMediaTransport: valid feedback from the correct source still binds a
     try nmt.register("#call", "alice", .voice, 100, .{});
 
     var key: [native_feedback.envelope_key_len]u8 = undefined;
-    kagura_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
+    cadence_frame.deriveNativeMediaMacKey(&root, "#call", "alice", &key);
     defer std.crypto.secureZero(u8, key[0..]);
     var payload_buf: [32]u8 = undefined;
     const payload = try native_feedback.encodeKeyframeRequest(200, &payload_buf);

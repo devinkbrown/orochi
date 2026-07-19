@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Signed dotted delta envelopes for Goryu-Sync CRDT mutations.
+//! Signed dotted delta envelopes for Concord-Sync CRDT mutations.
 //!
 //! The relay is not part of the trust boundary: peers verify that the origin
 //! node's Ed25519 key signed the canonical envelope CID, then separately ask a
@@ -292,7 +292,7 @@ test "sign and verify round-trip" {
     const kp = try testKey(0x42);
     const public_key = kp.public_key.toBytes();
 
-    const env = testEnvelope(&kp, 1234, "#goryu", "join:42:+o");
+    const env = testEnvelope(&kp, 1234, "#concord", "join:42:+o");
     const signed = try sign(env, &kp);
 
     try std.testing.expectEqual(cid(env), signed.cid);

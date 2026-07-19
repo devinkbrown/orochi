@@ -36,13 +36,13 @@ coexistence — the thing the conservative branch fix `fix/mesh-forged-account-h
 ## 1. Problem & non-functional targets (§2.1)
 
 ### 1.1 The requirement, in one paragraph
-On the Suimyaku mesh a `MEMBERSHIP` frame carries a plaintext `account` field
+On the Undertow mesh a `MEMBERSHIP` frame carries a plaintext `account` field
 (`src/proto/membership_event.zig:92`). Frame signing (`s2s_peer.verifiedPayload`,
 `originShortId(pubkey) == remote_node_id`) proves **which node authored the frame**, not that the
 node **authenticated a user** under that account — and the account bytes ride inside that
 node-signed payload, so a node can put anything there. A compromised *admitted* peer therefore
 emits `MEMBERSHIP nick=kain account=kain`; `route_table.resolveIncomingNick`
-(`src/substrate/suimyaku/route_table.zig:479`) reads `sameAccount(...)`, returns
+(`src/substrate/undertow/route_table.zig:479`) reads `sameAccount(...)`, returns
 `local_same_account` / `remote_same_account` / `reclaim_local`, **suppresses the UID-rename**, and
 homes the phantom under the real nick — drawing a third node's cross-node DM/metadata delivery to
 the attacker. **When this is done:** a node can *verify* that a remote `account=kain` claim is
@@ -220,8 +220,8 @@ construction here, proven by Phase-4 DST before the verify gate lands.
 |---|---|---|
 | `src/proto/account_identity.zig` | changed (+~80) | Add the **residence** transcript + `signResidence`/`verifyResidence`: canonical length-prefixed `{magic "ARP1", account, node:u64(shortId), epoch:u64, expiry_ms:u64}`, own domain label, `verifyStrict`. Structural-parse-before-crypto (copy `oper_cred_share` shape). Std-only, allocation-free. Lives here because it reuses the identity key + hex helpers. |
 | `src/daemon/server.zig` | changed | (a) new command **`IDENTITY RESIDENCE <node-shortId> <epoch> <expiry_ms> <sig-hex>`**: account-gated, `verifyResidence` against the caller's own replicated `identity.key.*` pubkey, store as prop `identity.residence.<node>` and `propagateLocalEntityProp`; (b) **`verifyResidenceTrust(account, ev.origin_node, now)`** helper → the per-claim `bool`; (c) tombstone the residence prop on the client's session close (§4.3); (d) advertise an ISUPPORT token so onyx knows the daemon supports it. |
-| `src/substrate/suimyaku/s2s_peer.zig` | changed | In `recvMembership`/`recvNickChange`, compute `account_trusted = server.verifyResidenceTrust(ev.account, ev.origin_node, now)` **only when the frame passed `verifiedPayload`** (origin-authenticated), and pass it to `resolveIncomingNick`. On `false`, pass `account = ""` (belt-and-braces so no downstream path trusts the wire account). |
-| `src/substrate/suimyaku/route_table.zig` | changed (−1 const) | No signature change (already takes `account_trusted`). Delete the `wire_account_trusted` const; the value now flows from the verifier. Enforce the **sticky-trust** rule in §4.4 at the same-node re-affirm path. |
+| `src/substrate/undertow/s2s_peer.zig` | changed | In `recvMembership`/`recvNickChange`, compute `account_trusted = server.verifyResidenceTrust(ev.account, ev.origin_node, now)` **only when the frame passed `verifiedPayload`** (origin-authenticated), and pass it to `resolveIncomingNick`. On `false`, pass `account = ""` (belt-and-braces so no downstream path trusts the wire account). |
+| `src/substrate/undertow/route_table.zig` | changed (−1 const) | No signature change (already takes `account_trusted`). Delete the `wire_account_trusted` const; the value now flows from the verifier. Enforce the **sticky-trust** rule in §4.4 at the same-node re-affirm path. |
 | onyx `src/lib/e2ee/deviceSign.ts` | **new** | Device Ed25519 signing key in `onyx-keys` (non-extractable); `enrollIdentity()` → `IDENTITY ADD`; `signResidence({account,node,epoch,expiry})` → `IDENTITY RESIDENCE`. Fail-closed (a sign error blocks the trusted path, never downgrades). |
 | onyx `src/lib/irc/*` + `src/lib/store/*` | changed | On login (token advertised): enroll key if absent, learn the home node-shortId (from `001`/ISUPPORT), sign + send `IDENTITY RESIDENCE`; re-sign on reconnect-to-different-node / epoch change. |
 

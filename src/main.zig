@@ -110,7 +110,7 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print(
         \\
         \\  Orochi {s}  (大蛇)
-        \\  Zig-native mesh IRC daemon — Suimyaku + Tsumugi mesh
+        \\  Zig-native mesh IRC daemon — Undertow + Mooring mesh
         \\
         \\
     , .{orochi.version_full});
@@ -411,7 +411,7 @@ pub fn main(init: std.process.Init) !void {
     // PQ-secured S2S is ON BY DEFAULT: an explicit `[node] secret_key` takes
     // precedence (and never touches the keyfile); otherwise the daemon loads — or
     // generates + persists (0600) — the seed from `orochi-node.key` next to the
-    // config (CWD without one), so the secured Tsumugi mesh needs no manual key.
+    // config (CWD without one), so the secured Mooring mesh needs no manual key.
     // The identity outlives the server (it borrows a pointer); only a keyfile or
     // identity error leaves S2S plaintext.
     var node_id_holder: ?orochi.daemon.node_identity.NodeIdentity = null;

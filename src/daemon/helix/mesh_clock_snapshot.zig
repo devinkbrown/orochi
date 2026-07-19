@@ -23,7 +23,7 @@
 //! The codec is allocation-free and fixed-size. Short, wrong-magic, unsupported,
 //! and trailing payloads fail closed rather than partially restoring clock state.
 const std = @import("std");
-const mesh_clock = @import("../../substrate/suimyaku/mesh_clock.zig");
+const mesh_clock = @import("../../substrate/undertow/mesh_clock.zig");
 const relay_v2_activation = @import("../relay_v2_activation.zig");
 
 pub const Error = error{

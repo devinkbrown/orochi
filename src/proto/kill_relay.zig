@@ -7,7 +7,7 @@
 //! `killer` (a full `nick!user@host` mask, or `SYSTEM` for an anonymized
 //! override) killed the user `target` with this `reason`". The killer's node has
 //! already enforced operator authority (`client_kill` privilege); the frame is
-//! signed by that node's Tsumugi identity, so the owning node honors it and
+//! signed by that node's Mooring identity, so the owning node honors it and
 //! disconnects its local `target`. Unlike the convergent facts, a KILL is a
 //! one-shot COMMAND — peers do not store it.
 //!

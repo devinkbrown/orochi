@@ -1,6 +1,6 @@
 # Mesh operations commands
 
-*Suimyaku mesh introspection, routing, health, and Helix in-place upgrade.*
+*Undertow mesh introspection, routing, health, and Helix in-place upgrade.*
 
 The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `ROUTE`, and `NETHEALTH` (`src/daemon/modules/oper_security.zig:132`). The `query.info` module registers `LINKS` and `MAP` as server-information commands (`src/daemon/modules/query_info.zig:68`). The upgrade module registers `UPGRADE`, which checks oper status inside its handler (`src/daemon/modules/upgrade.zig:21`, `src/daemon/server.zig:6076`).
 
@@ -40,7 +40,7 @@ The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `
 ## NETHEALTH
 
 - Syntax: `NETHEALTH`
-- Description: Renders Sazanami-style liveness for this node and each established peer, including link RTT and idle time when known.
+- Description: Renders Ripple-style liveness for this node and each established peer, including link RTT and idle time when known.
 - Privileges: Oper (`.access = .oper`).
 - Parameters: None.
 - Replies: Server notices containing health report lines.
@@ -51,7 +51,7 @@ The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `
 ## LINKS
 
 - Syntax: `LINKS`
-- Description: Lists Suimyaku mesh peers, not a TS6 spanning tree.
+- Description: Lists Undertow mesh peers, not a TS6 spanning tree.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: `RPL_LINKS 364`, `RPL_ENDOFLINKS 365`.
@@ -62,7 +62,7 @@ The `oper.security` module registers the mesh oper commands `MESH`, `NETSTAT`, `
 ## MAP
 
 - Syntax: `MAP`
-- Description: Renders the Suimyaku mesh topology map.
+- Description: Renders the Undertow mesh topology map.
 - Privileges: Registered client.
 - Parameters: None.
 - Replies: `RPL_MAP 15`, `RPL_MAPEND 17`.

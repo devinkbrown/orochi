@@ -12,7 +12,7 @@
 //!
 //! This is the crypto analog of `transport_stack.zig`/`media_session.zig`: a thin
 //! coordinator wiring independently-tested modules. Live wiring onto the S2S link
-//! waits on the Tsumugi handshake (task #2) which supplies node identity; this
+//! waits on the Mooring handshake (task #2) which supplies node identity; this
 //! module is transport-agnostic and deterministic, so it slots into the DST
 //! harness now.
 const std = @import("std");

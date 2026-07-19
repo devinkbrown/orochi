@@ -15,29 +15,29 @@ only for the platform syscalls that require it.
 
 | Command | What it does | Source |
 |---|---|---|
-| `zig build` | Builds and installs `zig-out/bin/orochi` and the `yoroi` crypto CLI (`zig-out/bin/yoroi`). | `build.zig` |
+| `zig build` | Builds and installs `zig-out/bin/orochi` and the `armor` crypto CLI (`zig-out/bin/armor`). | `build.zig` |
 | `zig build run -- <config.toml>` | Builds, installs, then runs the daemon with forwarded args. | `build.zig` |
 | `zig build test` | Runs module tests and executable-root tests. | `build.zig` |
 | `zig build test -Dtest-filter=<text>` | Runs tests whose names contain the filter. | `build.zig` |
 | `zig build test-mod -Dtest-filter=<text>` | Runs only the library/module test artifact with the optional filter. | `build.zig` |
 | `zig build test-exe -Dtest-filter=<text>` | Runs only the executable-root test artifact with the optional filter. | `build.zig` |
-| `zig build test-tls` | Runs focused Yoroi TLS/mTLS/ECH/RPK/DC tests. | `build.zig` |
+| `zig build test-tls` | Runs focused Armor TLS/mTLS/ECH/RPK/DC tests. | `build.zig` |
 | `zig build test-server` | Runs focused daemon/server integration and auth tests. | `build.zig` |
 | `zig build test-config` | Runs focused TOML/config parsing and boot-projection tests. | `build.zig` |
 | `zig build test-ircx` | Runs focused IRCX, PROP, ACCESS, DATA, LISTX, MODEX, and SACCESS tests. | `build.zig` |
 | `zig build test-event-spine` | Runs focused event-spine, EVENT, observe, and playback tests. | `build.zig` |
-| `zig build test-mesh` | Runs focused Suimyaku mesh, S2S, repair, and secured-link tests. | `build.zig` |
+| `zig build test-mesh` | Runs focused Undertow mesh, S2S, repair, and secured-link tests. | `build.zig` |
 | `zig build test-media` | Runs focused media, DTLS-SRTP, SFU, native-media, WebTransport, RTP, and RTCP tests. | `build.zig` |
 | `zig build test-services` | Runs focused services, account, SASL, TOTP, WebAuthn, session, and Tegami tests. | `build.zig` |
 | `zig build test-helix` | Runs focused Helix upgrade, migration, resume, capsule, and handoff tests. | `build.zig` |
-| `zig build test-cli` | Runs the `yoroi` crypto CLI toolkit tests. | `build.zig` |
+| `zig build test-cli` | Runs the `armor` crypto CLI toolkit tests. | `build.zig` |
 | `zig build test-smoke` | Runs `check` plus focused TLS/server/config suites. | `build.zig` |
 | `zig build test-roadmap` | Runs `check` plus focused server roadmap suites. | `build.zig` |
 | `zig build all-checks` | Runs deterministic pre-push checks: `check`, WASM build, full tests, bounded fuzz replay, and BoGo shim self-tests. | `build.zig` |
 | `zig build test-verbose` | Runs full tests with per-test progress output. | `build.zig` |
 | `zig build all-checks-verbose` | Runs deterministic pre-push checks with per-test progress output for the full suite. | `build.zig` |
 | `zig build check` | Type-checks the daemon without emitting a binary. | `build.zig` |
-| `zig build wasm` | Builds browser-facing KaguraVox/KaguraVis codec and transport WASM modules. | `build.zig` |
+| `zig build wasm` | Builds browser-facing CadenceVox/CadenceVis codec and transport WASM modules. | `build.zig` |
 | `zig build release` | Builds an optimized stripped daemon with `ReleaseFast`. | `build.zig` |
 | `zig build package` | Stages the ReleaseFast daemon, reference config, and systemd unit into the install prefix. | `build.zig` |
 

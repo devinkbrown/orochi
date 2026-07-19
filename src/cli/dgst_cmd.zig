@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `yoroi dgst` — SHA-2 digests and HMAC over a file or stdin, backed by
+//! `armor dgst` — SHA-2 digests and HMAC over a file or stdin, backed by
 //! src/crypto/hash.zig (`Sha256/384/512`, `Hmac`). The HMAC key is read from a
 //! FILE (`-hmac-key <path>`), never from argv, so key bytes can't leak into
 //! process listings or shell history; the key buffer is wiped after use.
@@ -23,7 +23,7 @@ pub const Options = struct {
 
 pub fn usage(w: *Writer) Writer.Error!void {
     try w.writeAll(
-        \\usage: yoroi dgst [-sha256|-sha384|-sha512] [-hmac-key <path>] [file]
+        \\usage: armor dgst [-sha256|-sha384|-sha512] [-hmac-key <path>] [file]
         \\  -sha256/-sha384/-sha512   digest algorithm (default sha256)
         \\  -hmac-key <path>          compute HMAC with the key read from that
         \\                            file (never pass key material on argv);
@@ -108,7 +108,7 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
 
 const testing = std.testing;
 
-test "yoroicli dgst matches the FIPS 180-2 'abc' vectors" {
+test "armorcli dgst matches the FIPS 180-2 'abc' vectors" {
     var aw = Writer.Allocating.init(testing.allocator);
     defer aw.deinit();
 
@@ -127,7 +127,7 @@ test "yoroicli dgst matches the FIPS 180-2 'abc' vectors" {
     );
 }
 
-test "yoroicli dgst HMAC matches RFC 4231 test case 2" {
+test "armorcli dgst HMAC matches RFC 4231 test case 2" {
     // Key "Jefe", data "what do ya want for nothing?".
     var aw = Writer.Allocating.init(testing.allocator);
     defer aw.deinit();
@@ -138,7 +138,7 @@ test "yoroicli dgst HMAC matches RFC 4231 test case 2" {
     );
 }
 
-test "yoroicli dgst refuses -hmac (key on argv)" {
+test "armorcli dgst refuses -hmac (key on argv)" {
     try testing.expectError(error.Usage, parseArgs(&.{ "-hmac", "sekrit" }));
     const opts = try parseArgs(&.{ "-sha384", "-hmac-key", "key.bin", "input.txt" });
     try testing.expectEqual(hash.Alg.sha384, opts.alg);

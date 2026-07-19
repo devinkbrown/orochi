@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Discord-compatible incoming webhook bindings (Torii interop).
+//! Discord-compatible incoming webhook bindings (Gateway interop).
 //!
 //! An operator-created binding maps an opaque `{id, token}` pair to a channel.
 //! An external integration that already POSTs Discord's webhook JSON can target

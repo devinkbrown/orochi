@@ -80,7 +80,7 @@ exact-once mesh delivery plane.
   still transition. (`src/daemon/server.zig`)
 - **Durable MESSAGE_V2 exact-once mesh delivery is now active on the mesh.** The
   reusable-session mesh rewrite that landed in this window activates exact-once
-  message relay across the secured Suimyaku mesh: RVL2 per-origin ordered replay
+  message relay across the secured Undertow mesh: RVL2 per-origin ordered replay
   with per-target cursors, an RVO2 per-hop retransmit-until-ACK outbox, an ADS1
   per-attachment delivery spool, a direct-neighbor custody graph pinned by
   `[mesh].trust_roots`, and a `relay_v2` activation state machine (`compat`/`active`
@@ -196,7 +196,7 @@ Deployed to the live nodes (eshmaki.me + ircx.us).
 ## 0.4.0 (deployed 2026-07-13)
 
 Deployed to the live IRCXNet nodes. A security-, TLS-, and anti-abuse-hardening
-pass on top of 0.3.0, plus the new standalone `yoroi` crypto CLI.
+pass on top of 0.3.0, plus the new standalone `armor` crypto CLI.
 
 ### TLS
 - **Extended Master Secret (RFC 7627) is now REQUIRED by default** on the
@@ -248,13 +248,13 @@ pass on top of 0.3.0, plus the new standalone `yoroi` crypto CLI.
   (`src/daemon/server.zig:18713`)
 
 ### Tooling
-- **`yoroi` — a standalone, openssl-parity crypto CLI.** `zig build` now also
-  produces `zig-out/bin/yoroi`, a pure-Zig toolkit over the same crypto substrate
+- **`armor` — a standalone, openssl-parity crypto CLI.** `zig build` now also
+  produces `zig-out/bin/armor`, a pure-Zig toolkit over the same crypto substrate
   the daemon uses. Verbs: `x509`, `genpkey`, `pkey`, `req`, `dgst`, `verify`,
   `rand`, `ciphers`, `asn1parse` (with `s_client`/`s_server`/`enc`/`ocsp`/`crl`
   reserved, exit 3). Scriptable exit codes: `0` ok, `1` failed, `2` usage, `3`
   not implemented. Focused tests: `zig build test-cli`.
-  (`src/cli/yoroi_main.zig:15`, `build.zig:458`)
+  (`src/cli/armor_main.zig:15`, `build.zig:458`)
 
 ### Security
 - **Hidden-channel roster leak closed.** `NAMES <channel>`, bare `NAMES`, `WHO
@@ -273,7 +273,7 @@ pass on top of 0.3.0, plus the new standalone `yoroi` crypto CLI.
   mechanism, with the generic `SASL authentication failed` surface (suspended vs
   forbidden vs bad-credential are indistinguishable — no enumeration).
   (`fix(security): gate SASL success on account status`)
-- **AEAD key stack hygiene.** The Tsumugi secured-mesh record layer left a
+- **AEAD key stack hygiene.** The Mooring secured-mesh record layer left a
   plaintext ChaCha key copy un-zeroed on the stack in `sealRecord`/`openRecord`
   (every post-handshake record); now `secureZero`'d on scope exit like its
   siblings — defense-in-depth against core-dump / co-resident disclosure.
@@ -316,7 +316,7 @@ pass on top of 0.3.0, plus the new standalone `yoroi` crypto CLI.
 
 ## 0.3.0 — "Sumi-e onboarding" (2026-07-08)
 
-The Torii onboarding + interop features and the first Sumi-e (v1.1) server
+The Gateway onboarding + interop features and the first Sumi-e (v1.1) server
 primitive, on top of the 0.2.0 security base.
 
 ### Added
@@ -347,12 +347,12 @@ primitive, on top of the 0.2.0 security base.
   on the wire when the feature is unused.
   (`feat: server-side named conversations (topics) within a channel`)
 - **Discord-compatible incoming webhooks.** A Discord-shaped webhook endpoint so
-  existing integrations post into a channel with no code changes (Torii interop).
+  existing integrations post into a channel with no code changes (Gateway interop).
   (`feat(webhook): Discord-compatible incoming webhook endpoint`)
-- **v1.0 "Torii" packaging.** Reproducible, signed release tooling and a
+- **v1.0 "Gateway" packaging.** Reproducible, signed release tooling and a
   self-host quickstart: `packaging/release.sh`, `verify-release.sh`, a Dockerfile,
   and `orochi.quickstart.toml` (`docker run` → live chat in ~60s).
-  (`feat(packaging): v1.0 Torii self-host quickstart + reproducible signed release`)
+  (`feat(packaging): v1.0 Gateway self-host quickstart + reproducible signed release`)
 
 ### Notes
 - Fully backward-compatible: every new feature is opt-in or byte-identical when
@@ -388,7 +388,7 @@ Pre-0.2.0 milestones (mesh, hot-upgrade, services-as-commands, IRCX/Event Spine,
 the in-house TLS stack, the media plane) predate this file; see
 `git log` and `docs/` for the full history. Highlights:
 
-- **Mesh:** Suimyaku overlay (HyParView + Plumtree + witnessed-SWIM), delta-CRDT
+- **Mesh:** Undertow overlay (HyParView + Plumtree + witnessed-SWIM), delta-CRDT
   channel state, wall-clock-HLC causality, cross-mesh oper grants + session
   reclaim, zero-drop `USR2` hot-upgrades that carry live TLS + mesh links across
   `execve` (Helix).

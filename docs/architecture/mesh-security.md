@@ -1,10 +1,10 @@
 # Orochi mesh security architecture
 
-*The security model for server-to-server (Suimyaku) traffic: what each layer guarantees, against which adversary, and how the wire enforces it.*
+*The security model for server-to-server (Undertow) traffic: what each layer guarantees, against which adversary, and how the wire enforces it.*
 
 This document describes how Orochi authenticates and protects server-to-server
-(Suimyaku) traffic as it exists in the current source tree. It complements
-[crypto.md](crypto.md) (primitives, TLS, Tsumugi AKE) and
+(Undertow) traffic as it exists in the current source tree. It complements
+[crypto.md](crypto.md) (primitives, TLS, Mooring AKE) and
 [mesh-s2s.md](mesh-s2s.md) (frame transport, CRDT convergence, routing) by
 focusing on the **security model**: what each layer guarantees, against which
 adversary, and how the wire enforces it.
@@ -22,7 +22,7 @@ The mesh assumes a **homogeneous, operator-pinned** deployment (see
 1. **Passive network attacker** on the S2S path — read/replay of cross-node
    CRDT and message traffic.
 2. **Active network attacker** — tamper, inject, reorder.
-3. **Compromised but trust-pinned peer** — a node that completed the Tsumugi AKE
+3. **Compromised but trust-pinned peer** — a node that completed the Mooring AKE
    and is in `trust_roots`, but is malicious or coerced, and tries to assert
    facts as if authored by a *third* node (forge membership, channel modes,
    props, or relayed messages on behalf of another node).
@@ -46,7 +46,7 @@ datagram-level media payload authentication (see "Media" below).
   ├─────────────────────────────────────────────────────────────┤
   │ L3  AEAD record layer (ChaCha20-Poly1305) over the CRDT stream│
   ├─────────────────────────────────────────────────────────────┤
-  │ L2  Tsumugi PQ-hybrid AKE  +  trust_roots pin  +  require_secured│
+  │ L2  Mooring PQ-hybrid AKE  +  trust_roots pin  +  require_secured│
   ├─────────────────────────────────────────────────────────────┤
   │ L1  TCP / listener (dual-stack)                               │
   └─────────────────────────────────────────────────────────────┘
@@ -56,10 +56,10 @@ L2 authenticates *the peer* and derives keys. L3 makes the channel
 confidential + integrity-protected. L4 authenticates *the author of each fact*,
 end to end, which is the only layer that defends against adversary (3).
 
-### L2 — Tsumugi handshake, pinning, and fail-closed behavior
+### L2 — Mooring handshake, pinning, and fail-closed behavior
 
 `src/daemon/secured_s2s_link.zig` frames a TOFU signed-prekey preamble and the
-two PQ-hybrid AKE messages, then establishes a `tsumugi_handshake.Established`
+two PQ-hybrid AKE messages, then establishes a `mooring_handshake.Established`
 session carrying per-direction keys (`send_key`/`recv_key`) and nonces
 (`send_nonce`/`recv_nonce`). The authenticated peer signing key is exposed via
 `peerNodeKey()`.
@@ -74,11 +74,11 @@ session carrying per-direction keys (`send_key`/`recv_key`) and nonces
 
 ### L3 — AEAD record layer
 
-The Tsumugi AKE derives `send_key`/`recv_key`, but historically the
+The Mooring AKE derives `send_key`/`recv_key`, but historically the
 post-handshake CRDT byte stream was passed **in plaintext** to the inner
 `S2sLink`. It is now wrapped in an AEAD record layer
 (`src/daemon/secured_s2s_link.zig` `feedInner`/`drainInner`, with
-`Established.sealRecord`/`openRecord` in `src/crypto/tsumugi_handshake.zig`):
+`Established.sealRecord`/`openRecord` in `src/crypto/mooring_handshake.zig`):
 
 ```text
 record := [u32 len LE][ ChaCha20-Poly1305 ciphertext ][ 16-byte tag ]
@@ -113,7 +113,7 @@ cannot forge a third node's frame. It rests on one observation:
 
 An attacker cannot forge node X's frame without X's private key; substituting
 their own key changes the derived id, so check (1) fails. The shared primitive is
-`src/substrate/suimyaku/signed_frame.zig` (`wrap`/`unwrap`/`verify`/
+`src/substrate/undertow/signed_frame.zig` (`wrap`/`unwrap`/`verify`/
 `originShortId`). Every signature is **domain-separated** (a distinct context
 label per use) so it can never be replayed across frame types or against the
 node-identity / oper-grant / migration-token signatures.
@@ -130,7 +130,7 @@ with a foreign origin**.
 
 For these, the sender wraps the payload in a signed envelope
 `[pubkey 32][sig 64][payload]` (signed over `frame_type ++ payload`). The
-receiver's `verifiedPayload` (`src/substrate/suimyaku/s2s_peer.zig`) requires the
+receiver's `verifiedPayload` (`src/substrate/undertow/s2s_peer.zig`) requires the
 signature **and** `originShortId(pubkey) == remote_node_id` — the cryptographic
 upgrade of `acceptsDirectOrigin` from link-trust to proof. This is gated by a
 handshake-negotiated capability (below).
@@ -182,13 +182,13 @@ re-forwarded.
 ## Media
 
 The WebRTC media plane (`media_plane.zig`) is authenticated by STUN
-MESSAGE-INTEGRITY over the negotiated ICE credentials. The native KaguraVox/KaguraVis
-plane (`kagura` codec over UDP) uses trust-on-first-use address binding: the
+MESSAGE-INTEGRITY over the negotiated ICE credentials. The native CadenceVox/CadenceVis
+plane (`cadence` codec over UDP) uses trust-on-first-use address binding: the
 first datagram for a `stream_id` binds the publisher's source address, and later
 datagrams from a different address are dropped.
 
 The pre-binding window is closed by making the `stream_id` **unguessable**. The
-id is issued by the server and stamped by the client into every kagura frame; it
+id is issued by the server and stamped by the client into every cadence frame; it
 is derived as a keyed PRF — `HMAC-SHA256(native_stream_key, channel ":" nick)`
 truncated to u32 (`server.zig` `nativeStreamId`) — under a per-process random
 secret (`native_stream_key`, seeded via `secure_fns.randomBytes`). It is
@@ -248,8 +248,8 @@ cloak never collides with a non-epoch cloak (`src/proto/cloak.zig:186`).
 
 ## What this does not cover (future, cross-component)
 
-A per-datagram MAC on the kagura media **payload** itself would add
-defense-in-depth beyond the unguessable stream id, but the kagura frame is
+A per-datagram MAC on the cadence media **payload** itself would add
+defense-in-depth beyond the unguessable stream id, but the cadence frame is
 assembled in the Nexus/Ocean client JS (not this repo), so it requires a
 coordinated client + server change and is deliberately **not** stubbed
 server-only (it would be inert until the clients ship it).

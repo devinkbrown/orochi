@@ -12,7 +12,7 @@
 //!
 //! This is the seam the live io_uring path mirrors: the same `S2sLink.feed` /
 //! `outbound` cycle, with the simulator standing in for the socket. It is the
-//! foundation the live Tsumugi handshake wiring (#2) and world projection (#6)
+//! foundation the live Mooring handshake wiring (#2) and world projection (#6)
 //! build on — both can be exercised here before touching real sockets.
 const std = @import("std");
 

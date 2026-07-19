@@ -16,7 +16,7 @@ use "IRCXNet" as a public product or network identity in new copy.
 | Name | What it is | Use it for |
 | --- | --- | --- |
 | **Onyx** | The consumer-facing **network and product** — the thing people join. It is the browser client (`/home/kain/onyx`, SolidJS) *and* the community/network that client connects to. | "Join **Onyx**." The network name, the web app, the brand a user sees. |
-| **Orochi** | The **engine**: the pure-Zig, clean-room daemon you self-host (`/home/kain/orochi`), the `orochi/*` protocol/config namespace, and the Japanese-mythos internal subsystem names below (Suimyaku, Sazanami, Tsumugi, Yoroi, Helix …). | "Run your own **Orochi** node." The daemon, the wire/config surface, the codebase. |
+| **Orochi** | The **engine**: the pure-Zig, clean-room daemon you self-host (`/home/kain/orochi`), the `orochi/*` protocol/config namespace, and the internal subsystem codenames below (Undertow, Ripple, Mooring, Armor, Helix …). | "Run your own **Orochi** node." The daemon, the wire/config surface, the codebase. |
 | **IRCXNet** | **Retired** as a public identity. Survives **only** as a legacy/wire token where it is a literal value, not a brand — e.g. the `[cloak] suffix` tail (`kain.users.ircxnet`) and existing server/host slugs. | Never in new user-facing copy. Leave in place only as a wire/legacy literal. |
 | **IRCX** | The **protocol** (extended IRC: `PROP`/`ACCESS`/`EVENT`/`AUTH`). Unrelated to the retired "IRCXNet" name — do not conflate. | The wire protocol Orochi speaks. |
 | **Ink & Vermillion** | The **visual identity** — the palette/typography direction of the Onyx surfaces. | The look-and-feel, not the product name. |
@@ -35,18 +35,19 @@ name via `[network] name`.
 
 ## Subsystems
 
-Orochi names its major subsystems after Japanese mythos/terms rather than
-generic acronyms. First use of a codename in the guides and architecture docs
-links here.
+Orochi gives its major subsystems evocative codenames rather than generic
+acronyms. Several started as Japanese mythos/terms and are now rendered in
+English, with the original term kept in parentheses as etymology. First use of a
+codename in the guides and architecture docs links here.
 
 | Codename | What it is | Source |
 | --- | --- | --- |
-| **Suimyaku** (水脈) | The S2S CRDT mesh **state model**: logical/hybrid-logical clocks, delta-state CRDTs, and Merkle anti-entropy — the building blocks of the replicated mesh world state. (Membership and liveness are handled by Sazanami + Goryu below, not Suimyaku itself.) | `src/substrate/suimyaku/root.zig:4`, `src/substrate/suimyaku/` |
-| **Sazanami** (漣) | The witnessed failure-detection membership state machine: a pure, deterministic liveness detector driven by gossip probes and a witness quorum, deciding which nodes are alive/suspect/dead. | `src/substrate/sazanami.zig:4`, `src/substrate/suimyaku/gossip_round.zig:4` |
-| **Goryu** | The delta-state CRDT library (OR-Set, LWW register, dots/causal context) that models mesh membership and other replicated state carried over Suimyaku. | `src/substrate/suimyaku/goryu.zig:4` |
-| **Tsumugi** (紡ぎ) | The S2S secure-channel AKE and session ratchet: a Noise-IK-shaped, post-quantum-hybrid handshake (Ed25519 static node identity + X-Wing hybrid KEM) that establishes and re-keys the encrypted server-to-server link. | `src/crypto/tsumugi_handshake.zig:4`, `src/crypto/tsumugi_session.zig` |
+| **Undertow** (水脈) | The S2S CRDT mesh **state model**: logical/hybrid-logical clocks, delta-state CRDTs, and Merkle anti-entropy — the building blocks of the replicated mesh world state. (Membership and liveness are handled by Ripple + Concord below, not Undertow itself.) | `src/substrate/undertow/root.zig:4`, `src/substrate/undertow/` |
+| **Ripple** (漣) | The witnessed failure-detection membership state machine: a pure, deterministic liveness detector driven by gossip probes and a witness quorum, deciding which nodes are alive/suspect/dead. | `src/substrate/undertow/ripple.zig:4`, `src/substrate/undertow/gossip_round.zig:4` |
+| **Concord** | The delta-state CRDT library (OR-Set, LWW register, dots/causal context) that models mesh membership and other replicated state carried over Undertow. | `src/substrate/undertow/concord.zig:4` |
+| **Mooring** (紡ぎ) | The S2S secure-channel AKE and session ratchet: a Noise-IK-shaped, post-quantum-hybrid handshake (Ed25519 static node identity + X-Wing hybrid KEM) that establishes and re-keys the encrypted server-to-server link. | `src/crypto/mooring_handshake.zig:4`, `src/crypto/mooring_session.zig` |
 | **MeshPass** | Ed25519-signed capability admission tokens that gate which nodes may join the mesh; verified inside the encrypted handshake, fail-closed on tampered/untrusted material. | `src/proto/meshpass_props.zig:6`, `src/proto/server_about.zig:64` |
-| **Yoroi** (鎧) | The from-scratch, pure-Zig TLS stack and cryptographic primitive library (TLS 1.3 + hardened TLS 1.2, PQ-hybrid key exchange, AEADs, signing). | `src/proto/server_about.zig:65`, `src/crypto/` |
+| **Armor** (鎧) | The from-scratch, pure-Zig TLS stack and cryptographic primitive library (TLS 1.3 + hardened TLS 1.2, PQ-hybrid key exchange, AEADs, signing). | `src/proto/server_about.zig:65`, `src/crypto/` |
 | **Ringlane** | The reactor seam: all time and I/O flow through `Reactor`, so the daemon runs unchanged against either the real io_uring/system backend or the deterministic simulator (Deterministic Ocean). | `src/substrate/reactor.zig:4` |
 | **Helix** | The in-place `USR2` hot-upgrade: a replacement image is `execve`'d and adopts the running listener, live sessions, and the converged mesh view (each link's remote-member roster + the cross-mesh oper-grant registry) through typed migration capsules, with no connection-refused window. These capsules ride in memory across `execve`, so the carried mesh state survives a hot-upgrade but not a cold restart. | `src/daemon/helix/live.zig:4`, `src/substrate/upgrade_capsule.zig:4` |
 | **Koshi** | The operator-curated content filter: a small set of oper-curated patterns matched against outbound `PRIVMSG`/`NOTICE` bodies, where a hit blocks the message. | `src/daemon/content_filter.zig:4` |
@@ -56,8 +57,8 @@ links here.
 
 | Codename | What it is | Source |
 | --- | --- | --- |
-| **KaguraVox** | The native voice/audio codec used on the media plane and in the browser WASM export. | `src/proto/server_about.zig:66`, `src/wasm/kagura_wasm.zig:1` |
-| **KaguraVis** | The native video codec (intra/inter frames) paired with KaguraVox. | `src/proto/server_about.zig:66`, `src/wasm/kagura_wasm.zig:1` |
+| **CadenceVox** | The native voice/audio codec used on the media plane and in the browser WASM export. | `src/proto/server_about.zig:66`, `src/wasm/cadence_wasm.zig:1` |
+| **CadenceVis** | The native video codec (intra/inter frames) paired with CadenceVox. | `src/proto/server_about.zig:66`, `src/wasm/cadence_wasm.zig:1` |
 
 ## Cryptographic terms
 
@@ -73,7 +74,7 @@ the TLS, cloak, and account docs.
 
 ## See also
 
-- [Mesh & S2S architecture](../architecture/mesh-s2s.md) — how Suimyaku, Tsumugi, Sazanami, and Goryu fit together.
-- [Cryptography architecture](../architecture/crypto.md) — Yoroi and the Tsumugi handshake in depth.
+- [Mesh & S2S architecture](../architecture/mesh-s2s.md) — how Undertow, Mooring, Ripple, and Concord fit together.
+- [Cryptography architecture](../architecture/crypto.md) — Armor and the Mooring handshake in depth.
 - [Upgrade & WASM host](../architecture/04-upgrade-wasm.md) — the Helix upgrade path.
-- [Media architecture](../architecture/03-media.md) — the media plane and KaguraVox/KaguraVis.
+- [Media architecture](../architecture/03-media.md) — the media plane and CadenceVox/CadenceVis.

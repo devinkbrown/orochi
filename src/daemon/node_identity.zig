@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Daemon node identity: derive the Tsumugi handshake material from config.
+//! Daemon node identity: derive the Mooring handshake material from config.
 //!
 //! The sovereign identity is a 32-byte Ed25519 seed (config `node.secret_key`,
 //! hex). From it we deterministically derive everything `SecureLink` needs to run
@@ -10,7 +10,7 @@
 //!   * an X-Wing KEM keypair (seed = BLAKE3("MZ-KEM" ++ seed), domain-separated
 //!     so the KEM key can't be confused with the signing key),
 //!   * the 20-byte node id = BLAKE3-160(Ed25519 public key) — Orochi's sole
-//!     identity (matches tsumugi_handshake's convention),
+//!     identity (matches mooring_handshake's convention),
 //!   * the realm id = BLAKE3(realm string), so an operator can name a realm
 //!     ("local") and get a stable 32-byte RealmId.
 //!
@@ -20,7 +20,7 @@ const std = @import("std");
 
 const sign = @import("../crypto/sign.zig");
 const xwing = @import("../crypto/xwing.zig");
-const hs = @import("../crypto/tsumugi_handshake.zig");
+const hs = @import("../crypto/mooring_handshake.zig");
 const node_short_id = @import("../crypto/node_short_id.zig");
 
 const Blake3 = std.crypto.hash.Blake3;

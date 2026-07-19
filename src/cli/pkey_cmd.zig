@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `yoroi genpkey` / `yoroi pkey` — key generation and inspection.
+//! `armor genpkey` / `armor pkey` — key generation and inspection.
 //!
 //! Generation is 100% substrate: ECDSA P-256 via crypto/ecdsa_p256.zig
 //! (`KeyPair.generate`), Ed25519 via crypto/sign.zig (`KeyPair.generate`,
@@ -59,18 +59,18 @@ pub const InspectOptions = struct {
 
 pub fn genUsage(w: *Writer) Writer.Error!void {
     try w.writeAll(
-        \\usage: yoroi genpkey -algorithm ec|ed25519 [-out <path>]
+        \\usage: armor genpkey -algorithm ec|ed25519 [-out <path>]
         \\  -algorithm <alg>  key type: ec (ECDSA P-256) or ed25519
         \\  -out <path>       write the key there (file mode 0600); default stdout
         \\  (rsa / p384 generation and -passin encryption are not supported by
-        \\   the Yoroi substrate yet; both are rejected explicitly)
+        \\   the Armor substrate yet; both are rejected explicitly)
         \\
     );
 }
 
 pub fn inspectUsage(w: *Writer) Writer.Error!void {
     try w.writeAll(
-        \\usage: yoroi pkey -in <path> [-noout]
+        \\usage: armor pkey -in <path> [-noout]
         \\  -in <path>   private key PEM (EC PRIVATE KEY or PKCS#8 Ed25519)
         \\  -noout       print only the summary, not the key block
         \\  -passin ...  NOT SUPPORTED (no encrypted-PEM support; never put a
@@ -227,7 +227,7 @@ pub fn inspectPem(text: []const u8) !KeyInfo {
 }
 
 /// Fail-closed PKCS#8 walk (substrate DerReader) accepting only v0 Ed25519.
-/// Shared with `yoroi req` (the CLI's single PKCS#8 Ed25519 parser).
+/// Shared with `armor req` (the CLI's single PKCS#8 Ed25519 parser).
 pub fn parseEd25519Pkcs8(der: []const u8) ![32]u8 {
     var top = x509.DerReader.init(der);
     const seq = try top.readExpected(x509.Tag.sequence);
@@ -281,7 +281,7 @@ pub fn runInspect(gpa: Allocator, io: std.Io, opts: InspectOptions, out: *Writer
 const testing = std.testing;
 const builtin = @import("builtin");
 
-test "yoroicli genpkey ec emits a SEC1 PEM the substrate parses back" {
+test "armorcli genpkey ec emits a SEC1 PEM the substrate parses back" {
     var buf: [512]u8 = undefined;
     const key_pem = try generatePem(std.testing.io, .ec, &buf);
     try testing.expect(std.mem.startsWith(u8, key_pem, "-----BEGIN EC PRIVATE KEY-----"));
@@ -294,7 +294,7 @@ test "yoroicli genpkey ec emits a SEC1 PEM the substrate parses back" {
     try testing.expectEqual(@as(u8, 0x04), info.publicSlice()[0]);
 }
 
-test "yoroicli genpkey ed25519 emits PKCS#8 that fromSeed accepts" {
+test "armorcli genpkey ed25519 emits PKCS#8 that fromSeed accepts" {
     var buf: [512]u8 = undefined;
     const key_pem = try generatePem(std.testing.io, .ed25519, &buf);
     try testing.expect(std.mem.startsWith(u8, key_pem, "-----BEGIN PRIVATE KEY-----"));
@@ -304,7 +304,7 @@ test "yoroicli genpkey ed25519 emits PKCS#8 that fromSeed accepts" {
     try testing.expectEqual(@as(usize, 32), info.publicSlice().len);
 }
 
-test "yoroicli pkey inspection fails closed on malformed and truncated keys" {
+test "armorcli pkey inspection fails closed on malformed and truncated keys" {
     // Wrong OID inside PKCS#8.
     var der = ed25519Pkcs8Der(@splat(7));
     der[10] = 0x66; // corrupt the Ed25519 OID
@@ -322,7 +322,7 @@ test "yoroicli pkey inspection fails closed on malformed and truncated keys" {
     try testing.expectError(error.UnsupportedKey, inspectPem("hello world"));
 }
 
-test "yoroicli genpkey writes the key file 0o600" {
+test "armorcli genpkey writes the key file 0o600" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
 
@@ -341,7 +341,7 @@ test "yoroicli genpkey writes the key file 0o600" {
     try testing.expectEqual(@as(std.posix.mode_t, 0o600), mode);
 }
 
-test "yoroicli genpkey arg parsing: rsa/p384/passin are rejected explicitly" {
+test "armorcli genpkey arg parsing: rsa/p384/passin are rejected explicitly" {
     try testing.expectError(error.NotImplemented, parseGenArgs(&.{ "-algorithm", "rsa" }));
     try testing.expectError(error.NotImplemented, parseGenArgs(&.{ "-algorithm", "p384" }));
     try testing.expectError(error.NotImplemented, parseGenArgs(&.{ "-passin", "stdin" }));

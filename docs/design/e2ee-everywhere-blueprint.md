@@ -29,7 +29,7 @@ with audited-design, post-quantum, end-to-end-encrypted text and (later) voice.*
 
 | Must-have (v1.5) | Nice-to-have / later era |
 | --- | --- |
-| Group E2EE for **text channels + multi-party DMs** | E2EE **voice at scale** / stages (v2.3 Kagura) |
+| Group E2EE for **text channels + multi-party DMs** | E2EE **voice at scale** / stages (v2.3 Cadence) |
 | Server is **delivery-service, never a group member** | Full **RFC 9420 wire interoperability** with 3rd-party MLS clients |
 | Forward secrecy **and** post-compromise security on membership change | Federated cross-node MLS with adversarial nodes proven in DST |
 | **Multi-device** as first-class (a user = N leaves, not 1) | Post-quantum client handshake (**PQXDH-style**) — *staged, see §5* |

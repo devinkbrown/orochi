@@ -10,16 +10,16 @@ smallest lane that proves the change, then run a broader gate before pushing.
 | `zig build check` | Fast semantic/type check without emitting a daemon binary. |
 | `zig build test-mod -Dtest-filter="<text>" --summary all` | One focused library/module test filter. |
 | `zig build test-exe -Dtest-filter="<text>" --summary all` | One focused executable-root test filter. |
-| `zig build test-tls --summary all` | Yoroi TLS, mTLS, ECH, RPK, delegated credential, and record-size regressions. |
+| `zig build test-tls --summary all` | Armor TLS, mTLS, ECH, RPK, delegated credential, and record-size regressions. |
 | `zig build test-server --summary all` | Threaded server, auth, CertFP, and daemon integration regressions. |
 | `zig build test-config --summary all` | TOML parser, boot projection, and reference-config regressions. |
 | `zig build test-ircx --summary all` | IRCX discovery, PROP, ACCESS/SACCESS, DATA, LISTX, and MODEX paths. |
 | `zig build test-event-spine --summary all` | Event spine, IRCX EVENT, observe notes, policy events, and playback paths. |
-| `zig build test-mesh --summary all` | Suimyaku mesh, S2S, repair frames, secured links, CONNECT/SQUIT, and mesh projection paths. |
+| `zig build test-mesh --summary all` | Undertow mesh, S2S, repair frames, secured links, CONNECT/SQUIT, and mesh projection paths. |
 | `zig build test-media --summary all` | Media, DTLS-SRTP, SFU, native media, WebTransport, RTP, and RTCP paths. |
 | `zig build test-services --summary all` | Services, account auth, SASL, TOTP, WebAuthn, sessions, Tegami, and successor paths. |
 | `zig build test-helix --summary all` | Helix upgrade, migration, resume, capsule, and handoff paths. |
-| `zig build test-cli --summary all` | The `yoroi` crypto CLI toolkit (x509/genpkey/pkey/req/dgst/verify/rand/ciphers/asn1parse). |
+| `zig build test-cli --summary all` | The `armor` crypto CLI toolkit (x509/genpkey/pkey/req/dgst/verify/rand/ciphers/asn1parse). |
 | `zig build test-smoke --summary all` | Inner-loop roadmap gate: `check` plus TLS/server/config focused suites. |
 | `zig build test-roadmap --summary all` | Server-roadmap gate: `check` plus server/config/IRCX/event/mesh/services/TLS focused suites. |
 | `zig build test-smoke -Doptimize=ReleaseSafe --summary all` | Optimized smoke gate for safety-checked release codegen paths. |

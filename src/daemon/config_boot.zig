@@ -18,7 +18,7 @@ const conn_class = @import("conn_class.zig");
 const og_mod = @import("operator_groups.zig");
 const event_spine = @import("event_spine.zig");
 const wasm_bridge = @import("../wasm/host/bridge.zig");
-const kagura_frame = @import("../substrate/kagura_frame.zig");
+const cadence_frame = @import("../substrate/cadence_frame.zig");
 const media_session = @import("../substrate/media_session.zig");
 const certfp_bind = @import("certfp_bind.zig");
 const certfp = @import("../proto/certfp.zig");
@@ -678,7 +678,7 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(u32, 131072), loaded.config.s2s_config.link.peer_link_config.send_credit);
     try testing.expectEqual(@as(u64, 1500), loaded.config.s2s_config.link.gossip_interval_ms);
     try testing.expectEqual(@as(usize, 5), loaded.config.s2s_config.link.gossip_config.fanout);
-    try testing.expectEqual(@as(u8, 4), loaded.config.s2s_config.link.sazanami_config.witness_quorum);
+    try testing.expectEqual(@as(u8, 4), loaded.config.s2s_config.link.ripple_config.witness_quorum);
     try testing.expect(loaded.config.media_enabled);
     try testing.expectEqual(@as(u64, 12345), loaded.config.media_max_upload_bytes);
     try testing.expectEqual(@as(u64, 1200), loaded.config.media_max_frame_bytes);
@@ -694,7 +694,7 @@ test "config text overlays the server config" {
     try testing.expectEqual(@as(usize, 24), loaded.config.media_reactions_max_token_bytes);
     const reassembly_cfg = server.mediaReassemblyConfig(loaded.config);
     try testing.expectEqual(@as(u32, 32), reassembly_cfg.window);
-    var rx = media_session.Receiver(media_session.default_max_payload_bytes, kagura_frame.window_cap).init(reassembly_cfg);
+    var rx = media_session.Receiver(media_session.default_max_payload_bytes, cadence_frame.window_cap).init(reassembly_cfg);
     _ = &rx;
     try testing.expect(loaded.config.native_media_require_mac);
     try testing.expectEqual(@as(u16, 512), loaded.config.cqe_batch);

@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Framed secured S2S link: the live-path Tsumugi handshake over a byte stream.
+//! Framed secured S2S link: the live-path Mooring handshake over a byte stream.
 //!
-//! `tsumugi_session` drives the AKE message-at-a-time; on a real TCP stream the
+//! `mooring_session` drives the AKE message-at-a-time; on a real TCP stream the
 //! TOFU preamble, M1, and M2 must be delimited so they survive coalescing and
 //! splitting. This adapter length-prefixes ONLY those three handshake messages
 //! (u32 LE length + payload, reassembled through an inbound buffer). Those three
@@ -12,7 +12,7 @@
 //!
 //! Once the AKE establishes, the inner `S2sLink` CRDT stream is NOT trusted to
 //! the wire raw: every byte is wrapped in an AEAD record layer keyed on the
-//! Tsumugi `Established` directional keys (`send_key`/`recv_key`) so the entire
+//! Mooring `Established` directional keys (`send_key`/`recv_key`) so the entire
 //! post-handshake MESSAGE/MEMBERSHIP/MODE/TOPIC/NICK stream is confidential and
 //! tamper-evident on secured mesh links. See `record_*` constants for the wire
 //! format. The inner link's own `s2s_frame` decoder still frames the *plaintext*
@@ -26,21 +26,21 @@
 const std = @import("std");
 
 const node_identity = @import("node_identity.zig");
-const tsumugi_session = @import("../crypto/tsumugi_session.zig");
-const hs = @import("../crypto/tsumugi_handshake.zig");
+const mooring_session = @import("../crypto/mooring_session.zig");
+const hs = @import("../crypto/mooring_handshake.zig");
 const node_short_id = @import("../crypto/node_short_id.zig");
 const s2s_link = @import("s2s_link.zig");
 const session_replica = @import("helix/session_replica.zig");
 const s2s_frame = @import("../proto/s2s_frame.zig");
 const session_replica_frame = @import("../proto/session_replica_frame.zig");
-const signed_frame = @import("../substrate/suimyaku/signed_frame.zig");
-const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
-const message_relay_v2 = @import("../substrate/suimyaku/message_relay_v2.zig");
-const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
+const signed_frame = @import("../substrate/undertow/signed_frame.zig");
+const s2s_peer = @import("../substrate/undertow/s2s_peer.zig");
+const message_relay_v2 = @import("../substrate/undertow/message_relay_v2.zig");
+const partition_detector = @import("../substrate/undertow/partition_detector.zig");
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
 const oper_event = @import("../proto/oper_event.zig");
 
-pub const Role = tsumugi_session.Role;
+pub const Role = mooring_session.Role;
 
 /// Bound on a single buffered handshake message (prekey ~1.3KB, M1/M2 a few KB).
 const max_handshake_msg: u32 = 64 * 1024;
@@ -96,8 +96,8 @@ pub const Options = struct {
     /// so remote WHOIS (312) names the right per-server description. Empty = none.
     description: []const u8 = "",
     local_epoch_ms: u64 = 1000,
-    channel_name: []const u8 = "#suimyaku",
-    /// Config for the inner Suimyaku CRDT link created after the AKE.
+    channel_name: []const u8 = "#undertow",
+    /// Config for the inner Undertow CRDT link created after the AKE.
     inner_config: s2s_link.PeerConfig = .{},
     /// Optional trust pin: require the peer's node id to equal this. Null = TOFU.
     expected_remote: ?[20]u8 = null,
@@ -135,7 +135,7 @@ pub const SecuredLink = struct {
     inner_config: s2s_link.PeerConfig,
 
     phase: Phase,
-    session: ?tsumugi_session.Session = null,
+    session: ?mooring_session.Session = null,
     /// Set ONLY on a link resumed across a Helix hot-upgrade: the post-AKE
     /// `Established` (record keys + peer identity) rebuilt from its capsule instead
     /// of re-running the handshake. When present, `session` is null and every
@@ -200,7 +200,7 @@ pub const SecuredLink = struct {
             .phase = if (opts.role == .responder) .ake else .await_prekey,
         };
         if (opts.role == .responder) {
-            self.session = tsumugi_session.Session.initResponder(
+            self.session = mooring_session.Session.initResponder(
                 opts.allocator,
                 &opts.identity.sign_kp,
                 opts.local_prekey,
@@ -368,7 +368,7 @@ pub const SecuredLink = struct {
         return if (self.inner) |l| l.established() else false;
     }
 
-    /// Bounded outer (Tsumugi record-layer) resume state for the Helix s2s-link
+    /// Bounded outer (Mooring record-layer) resume state for the Helix s2s-link
     /// capsule. `established` is a by-value COPY of the live record keys — the
     /// capsule layer serializes it and should wipe its copy afterward. The
     /// `rec_inbuf`/`pending_out` slices are borrowed and valid only until the next
@@ -1157,7 +1157,7 @@ pub const SecuredLink = struct {
                 remote_prekey.verify(self.cfg.now_ms) catch return error.PrekeyRejected;
                 if (!self.allowsExpectedRemote(remote_prekey.node_id)) return error.UnexpectedRemote;
                 if (!self.trustRootAllows(remote_prekey.node_key)) return error.PrekeyRejected;
-                self.session = tsumugi_session.Session.initInitiator(
+                self.session = mooring_session.Session.initInitiator(
                     self.allocator,
                     &self.identity.sign_kp,
                     self.local_prekey,
@@ -1235,7 +1235,7 @@ pub const SecuredLink = struct {
         }
     }
 
-    /// The established Tsumugi keys (present once `phase == .established`). The
+    /// The established Mooring keys (present once `phase == .established`). The
     /// inner link is only created alongside establishment, so this never returns
     /// null on the post-AKE paths that call it.
     fn establishedKeys(self: *const SecuredLink) *const hs.Established {
@@ -1648,7 +1648,7 @@ test "event spine v2 is negotiated encrypted authored and drained through Secure
     try testing.expectEqual(oper_event.VerifyOutcome.verified, oper_event.verifyOrigin(event));
 }
 
-test "session replica v2 activates only inside established Tsumugi SecuredLink" {
+test "session replica v2 activates only inside established Mooring SecuredLink" {
     var p = try EstablishedPair.init();
     defer p.deinit();
     try testing.expect(p.a.supportsSessionReplicaV2());
@@ -1748,7 +1748,7 @@ test "post-handshake bytes on the wire are ciphertext, not inner plaintext" {
     // Snapshot the inner link's plaintext for this membership announcement, then
     // produce the secured wire bytes for the same announcement.
     const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "real name", .host = "h.example" };
-    try p.a.inner.?.sendMembership("#suimyaku", "alice", 0, 100, true, ident, "");
+    try p.a.inner.?.sendMembership("#undertow", "alice", 0, 100, true, ident, "");
     const plaintext = try testing.allocator.dupe(u8, p.a.inner.?.outbound());
     defer testing.allocator.free(plaintext);
     try testing.expect(plaintext.len != 0);
@@ -1768,7 +1768,7 @@ test "a single flipped bit in a transit record fails decryption" {
     p.b.clearOutbound();
 
     const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "r", .host = "h" };
-    try p.a.sendMembership("#suimyaku", "bob", 0, 200, true, ident, "");
+    try p.a.sendMembership("#undertow", "bob", 0, 200, true, ident, "");
     const record = try testing.allocator.dupe(u8, p.a.outbound());
     defer testing.allocator.free(record);
     try testing.expect(record.len > 4 + 16);
@@ -1787,7 +1787,7 @@ test "a CRDT membership frame round-trips end-to-end over the secured record lay
     p.b.clearOutbound();
 
     const ident = s2s_peer.MemberIdentity{ .username = "ann", .realname = "Ann Real", .host = "host.a" };
-    try p.a.sendMembership("#suimyaku", "ann", 0, 300, true, ident, "");
+    try p.a.sendMembership("#undertow", "ann", 0, 300, true, ident, "");
 
     // Pump the secured record(s) A->B (and any B->A acks) to convergence.
     try pump(&p.a, &p.b, false);
@@ -1796,11 +1796,11 @@ test "a CRDT membership frame round-trips end-to-end over the secured record lay
     p.b.setSessionTokenResolver(null);
     const token: s2s_link.S2sLink.SessionToken = @splat(0xD7);
     try testing.expectEqual(@as(usize, 1), try p.b.rebindSessionToken(p.ida.shortId(), "ann", token));
-    const desired = [_][]const u8{"#suimyaku"};
+    const desired = [_][]const u8{"#undertow"};
     const reconciled = try p.b.reconcileSessionToken(token, "ann", &desired);
     try testing.expectEqual(@as(usize, 0), reconciled.removed);
     try testing.expectEqual(@as(usize, 0), reconciled.renamed);
-    try testing.expect(std.crypto.timing_safe.eql(s2s_link.S2sLink.SessionToken, token, p.b.channelMembers("#suimyaku")[0].session_token.?));
+    try testing.expect(std.crypto.timing_safe.eql(s2s_link.S2sLink.SessionToken, token, p.b.channelMembers("#undertow")[0].session_token.?));
 
     const changes = try p.b.takeMembershipChanges();
     defer {
@@ -1897,7 +1897,7 @@ test "resumeOuter continues the encrypted stream and reconverges via RESYNC" {
 
     // B announces a member; A converges to it over the secured link.
     const ident = s2s_peer.MemberIdentity{ .username = "u", .realname = "Bob", .host = "h.b" };
-    try b.sendMembership("#suimyaku", "bob", 0, 100, true, ident, "");
+    try b.sendMembership("#undertow", "bob", 0, 100, true, ident, "");
     try pump(&a, &b, false);
     a.processDeferredResidenceFrames(100);
     try testing.expect(a.findRemoteMember("bob") != null);
@@ -1944,7 +1944,7 @@ test "resumeOuter continues the encrypted stream and reconverges via RESYNC" {
     try testing.expect(b.takeResyncRequest());
 
     // The daemon answers a RESYNC with a full membership burst. A2 reconverges.
-    try b.sendMembership("#suimyaku", "bob", 0, 200, true, ident, "");
+    try b.sendMembership("#undertow", "bob", 0, 200, true, ident, "");
     try pump(&a2, &b, false);
     a2.processDeferredResidenceFrames(200);
     try testing.expect(a2.findRemoteMember("bob") != null);

@@ -46,7 +46,7 @@ pub const CapId = enum(u6) {
     typing,
     orochi_session_sync,
     orochi_bouncer,
-    orochi_suimyaku_media,
+    orochi_undertow_media,
 };
 
 pub const CAP_COUNT: usize = @typeInfo(CapId).@"enum".field_names.len;
@@ -411,7 +411,7 @@ const default_specs = [_]CapSpec{
     .{ .id = .typing, .name = "typing" },
     .{ .id = .orochi_session_sync, .name = "orochi/session-sync" },
     .{ .id = .orochi_bouncer, .name = "orochi/bouncer" },
-    .{ .id = .orochi_suimyaku_media, .name = "orochi/suimyaku-media" },
+    .{ .id = .orochi_undertow_media, .name = "orochi/suimyaku-media" },
 };
 
 fn parseRequestedSet(registry: CapRegistry, raw_list: []const u8) ?RequestedSet {

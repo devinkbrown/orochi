@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `yoroi req` — PKCS#10 CSR generation from an existing private key.
+//! `armor req` — PKCS#10 CSR generation from an existing private key.
 //!
 //! The CSR structure comes from src/proto/csr.zig (`certificationRequestInfo`
 //! + `assemble`); signing is substrate-only (crypto/ecdsa_p256.zig `sign` +
@@ -47,7 +47,7 @@ pub const Options = struct {
 
 pub fn usage(w: *Writer) Writer.Error!void {
     try w.writeAll(
-        \\usage: yoroi req -key <path> -cn <name> [-dns <name>]... [-out <path>]
+        \\usage: armor req -key <path> -cn <name> [-dns <name>]... [-out <path>]
         \\  -key <path>   signing key PEM (EC PRIVATE KEY or PKCS#8 Ed25519)
         \\  -cn <name>    subject common name (required)
         \\  -dns <name>   SAN dNSName (repeatable; default: the CN)
@@ -178,14 +178,14 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
 const testing = std.testing;
 const x509 = orochi.crypto.x509;
 
-test "yoroicli req builds a verifiable ECDSA P-256 CSR" {
+test "armorcli req builds a verifiable ECDSA P-256 CSR" {
     // Arrange: a fresh EC key from genpkey.
     var key_buf: [512]u8 = undefined;
     const key_pem = try pkey_cmd.generatePem(std.testing.io, .ec, &key_buf);
 
     // Act
     var csr_pem_buf: [4096]u8 = undefined;
-    const csr_pem = try buildCsrPem(key_pem, "req.yoroicli.test", &.{ "req.yoroicli.test", "alt.test" }, &csr_pem_buf);
+    const csr_pem = try buildCsrPem(key_pem, "req.armorcli.test", &.{ "req.armorcli.test", "alt.test" }, &csr_pem_buf);
 
     // Assert: PEM label + the signature verifies against the embedded SPKI.
     try testing.expect(std.mem.startsWith(u8, csr_pem, "-----BEGIN CERTIFICATE REQUEST-----"));
@@ -213,12 +213,12 @@ test "yoroicli req builds a verifiable ECDSA P-256 CSR" {
     try testing.expect(ecdsa_p256.verify(sig, cri.raw, point));
 }
 
-test "yoroicli req builds a verifiable Ed25519 CSR" {
+test "armorcli req builds a verifiable Ed25519 CSR" {
     var key_buf: [512]u8 = undefined;
     const key_pem = try pkey_cmd.generatePem(std.testing.io, .ed25519, &key_buf);
 
     var csr_pem_buf: [4096]u8 = undefined;
-    const csr_pem = try buildCsrPem(key_pem, "ed.yoroicli.test", &.{}, &csr_pem_buf);
+    const csr_pem = try buildCsrPem(key_pem, "ed.armorcli.test", &.{}, &csr_pem_buf);
 
     var der_buf: [4096]u8 = undefined;
     const csr_der = try pem.decode(csr_pem, "CERTIFICATE REQUEST", &der_buf);
@@ -243,7 +243,7 @@ test "yoroicli req builds a verifiable Ed25519 CSR" {
     try testing.expect(try ed25519.verify(cri.raw, sig, public));
 }
 
-test "yoroicli req fails closed on a non-key input and bad args" {
+test "armorcli req fails closed on a non-key input and bad args" {
     var out_buf: [4096]u8 = undefined;
     try testing.expectError(error.UnsupportedKey, buildCsrPem("not a key", "cn.test", &.{}, &out_buf));
 

@@ -428,7 +428,7 @@ test "world migration round-trip recovers every channel and ban entry intact" {
         .{
             .name = "#orochi",
             .topic = "Welcome to the deep",
-            .topic_setter = "Suimyaku!user@host",
+            .topic_setter = "Undertow!user@host",
             .topic_ts = 1_700_000_000,
             .created_unix = 1_600_000_000,
             .oid = 0xDEAD_BEEF_CAFE_F00D,

@@ -25,10 +25,10 @@ const tegami_mod = @import("tegami.zig");
 const transcript_mod = @import("transcript.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const crypto_sign = @import("../crypto/sign.zig");
-const kagura_frame = @import("../substrate/kagura_frame.zig");
+const cadence_frame = @import("../substrate/cadence_frame.zig");
 const media_room = @import("media_room.zig");
 const multiline_mod = @import("../proto/multiline.zig");
-const s2s_peer_mod = @import("../substrate/suimyaku/s2s_peer.zig");
+const s2s_peer_mod = @import("../substrate/undertow/s2s_peer.zig");
 const search_index_mod = @import("search_index.zig");
 const relay_v2_activation = @import("relay_v2_activation.zig");
 const relay_v2_event_log = @import("relay_v2_event_log.zig");
@@ -471,7 +471,7 @@ pub const Config = struct {
         enabled: bool = false,
         max_upload_bytes: u64 = 16 * 1024 * 1024,
         max_frame_bytes: u64 = 64 * 1024,
-        reorder_window_frames: u32 = kagura_frame.default_reorder_window_frames,
+        reorder_window_frames: u32 = cadence_frame.default_reorder_window_frames,
         max_participants: u32 = @intCast(media_room.default_max_participants),
         sfu_max_breakout_label_bytes: u64 = media_room.max_breakout_bytes,
         captions_max_text_bytes: u64 = transcript_mod.max_text_bytes,
@@ -482,11 +482,11 @@ pub const Config = struct {
         pins_max_msgid_bytes: u64 = 64,
         reactions_max_token_bytes: u64 = 32,
         /// Require HMAC-tagged native KaguraVox/KaguraVis datagrams. Defaults off until
-        /// clients implement the matching Kagura-frame tag contract.
+        /// clients implement the matching Cadence-frame tag contract.
         native_media_require_mac: bool = false,
         /// Relay browser media datagrams (binary WebSocket frames) between a
         /// channel's call participants. Off by default; the WS media plane is
-        /// opt-in (the browser must encode Kagura frames and append the MAC).
+        /// opt-in (the browser must encode Cadence frames and append the MAC).
         ws_media_relay: bool = false,
         /// Require a valid per-stream MAC tag on every browser media datagram.
         /// When false (default) untagged datagrams still relay, but a present tag
@@ -571,7 +571,7 @@ pub const Config = struct {
         koshi_pattern_max_len: u64 = content_filter_mod.default_max_pattern_len,
     };
 
-    /// Discord-compatible incoming webhook endpoint (Torii interop). OFF by
+    /// Discord-compatible incoming webhook endpoint (Gateway interop). OFF by
     /// default: when `enabled` is false the listener never binds and the
     /// `WEBHOOK` command is not registered — the daemon is byte-identical to a
     /// build without this feature.
@@ -1271,7 +1271,7 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (doc.getBool("media.enabled")) |b| cfg.media.enabled = b;
     cfg.media.max_upload_bytes = try uintField(doc, "media.max_upload_bytes", cfg.media.max_upload_bytes, 0, 1024 * 1024 * 1024);
     cfg.media.max_frame_bytes = try uintField(doc, "media.max_frame_bytes", cfg.media.max_frame_bytes, 0, 16 * 1024 * 1024);
-    cfg.media.reorder_window_frames = @intCast(try uintField(doc, "media.reorder_window_frames", cfg.media.reorder_window_frames, 1, kagura_frame.window_cap));
+    cfg.media.reorder_window_frames = @intCast(try uintField(doc, "media.reorder_window_frames", cfg.media.reorder_window_frames, 1, cadence_frame.window_cap));
     cfg.media.max_participants = @intCast(try uintField(doc, "media.max_participants", cfg.media.max_participants, 1, media_room.max_participants));
     cfg.media.sfu_max_breakout_label_bytes = try uintField(doc, "media.sfu.max_breakout_label_bytes", cfg.media.sfu_max_breakout_label_bytes, 8, 256);
     cfg.media.captions_max_text_bytes = try uintField(doc, "media.captions_max_text_bytes", cfg.media.captions_max_text_bytes, 64, 4000);
@@ -1883,10 +1883,10 @@ fn parseMeshS2sConfig(doc: toml.Document, cfg: *s2s_peer_mod.Config) TomlError!v
     cfg.link.view_config.shuffle_active_count = @intCast(try uintField(doc, "mesh.gossip.view_shuffle_active", cfg.link.view_config.shuffle_active_count, 0, cfg.link.view_config.active_capacity));
     cfg.link.view_config.shuffle_passive_count = @intCast(try uintField(doc, "mesh.gossip.view_shuffle_passive", cfg.link.view_config.shuffle_passive_count, 0, cfg.link.view_config.passive_capacity));
 
-    cfg.link.sazanami_config.suspicion_timeout_ms = @intCast(try uintField(doc, "mesh.sazanami.suspicion_timeout_ms", @as(u64, @intCast(cfg.link.sazanami_config.suspicion_timeout_ms)), 0, 120_000));
+    cfg.link.ripple_config.suspicion_timeout_ms = @intCast(try uintField(doc, "mesh.sazanami.suspicion_timeout_ms", @as(u64, @intCast(cfg.link.ripple_config.suspicion_timeout_ms)), 0, 120_000));
     // Floor of 2: a single accuser must never bury a peer (see gossip_round.zig
     // SazanamiConfig.sanitized). Reject a configured quorum of 0/1 at parse time.
-    cfg.link.sazanami_config.witness_quorum = @intCast(try uintField(doc, "mesh.sazanami.witness_quorum", cfg.link.sazanami_config.witness_quorum, 2, 16));
+    cfg.link.ripple_config.witness_quorum = @intCast(try uintField(doc, "mesh.sazanami.witness_quorum", cfg.link.ripple_config.witness_quorum, 2, 16));
 
     cfg.link.peer_link_config.send_credit = @intCast(try uintField(doc, "mesh.link.send_credit_bytes", cfg.link.peer_link_config.send_credit, 4096, 16_777_216));
     cfg.link.peer_link_config.replay_window = try uintField(doc, "mesh.link.replay_window", cfg.link.peer_link_config.replay_window, 8, 4096);
@@ -2985,8 +2985,8 @@ test "parseToml: live mesh S2S sub-sections project onto peer driver config" {
     try testing.expectEqual(@as(usize, 12), cfg.mesh.s2s.link.view_config.passive_capacity);
     try testing.expectEqual(@as(usize, 3), cfg.mesh.s2s.link.view_config.shuffle_active_count);
     try testing.expectEqual(@as(usize, 6), cfg.mesh.s2s.link.view_config.shuffle_passive_count);
-    try testing.expectEqual(@as(i64, 9000), cfg.mesh.s2s.link.sazanami_config.suspicion_timeout_ms);
-    try testing.expectEqual(@as(u8, 4), cfg.mesh.s2s.link.sazanami_config.witness_quorum);
+    try testing.expectEqual(@as(i64, 9000), cfg.mesh.s2s.link.ripple_config.suspicion_timeout_ms);
+    try testing.expectEqual(@as(u8, 4), cfg.mesh.s2s.link.ripple_config.witness_quorum);
     try testing.expectEqual(@as(usize, 262144), cfg.mesh.s2s.link.burst_limits.max_burst_bytes);
     try testing.expectEqual(@as(usize, 1024), cfg.mesh.s2s.link.burst_limits.max_records);
 
@@ -3224,7 +3224,7 @@ test "parseToml: media sizing keys default, lift, and validate ranges" {
     ;
     var dflt = try parseToml(allocator, base, .{});
     defer dflt.deinit(allocator);
-    try testing.expectEqual(kagura_frame.default_reorder_window_frames, dflt.media.reorder_window_frames);
+    try testing.expectEqual(cadence_frame.default_reorder_window_frames, dflt.media.reorder_window_frames);
     try testing.expectEqual(@as(u32, @intCast(media_room.default_max_participants)), dflt.media.max_participants);
     try testing.expectEqual(@as(u64, transcript_mod.max_text_bytes), dflt.media.captions_max_text_bytes);
     try testing.expectEqual(@as(u64, transcript_mod.max_speaker_bytes), dflt.media.captions_max_speaker_bytes);
@@ -3280,7 +3280,7 @@ test "parseToml: media sizing keys default, lift, and validate ranges" {
     try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media.pins]\nmax_msgid_bytes = 7\n", .{}));
     try testing.expectError(error.ParseError, parseToml(allocator, base ++ "[media.reactions]\nmax_token_bytes = 7\n", .{}));
 
-    const too_wide_window = try std.fmt.allocPrint(allocator, "{s}[media]\nreorder_window_frames = {d}\n", .{ base, kagura_frame.window_cap + 1 });
+    const too_wide_window = try std.fmt.allocPrint(allocator, "{s}[media]\nreorder_window_frames = {d}\n", .{ base, cadence_frame.window_cap + 1 });
     defer allocator.free(too_wide_window);
     try testing.expectError(error.ParseError, parseToml(allocator, too_wide_window, .{}));
 

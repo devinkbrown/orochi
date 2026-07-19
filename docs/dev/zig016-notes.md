@@ -47,7 +47,7 @@ Each file you create must be self-contained (import only `std`) so it can be tes
 ## Design references
 
 - `docs/architecture/00-overview.md` — subsystems, request flow, and source map (authoritative, source-cited).
-- `docs/reference/glossary.md` — codename key (Suimyaku, Tsumugi, Sazanami, Helix, Yoroi, Ringlane, …).
+- `docs/reference/glossary.md` — codename key (Undertow, Mooring, Ripple, Helix, Armor, Ringlane, …).
 - `docs/reference/config.md` — full config schema, cited to `src/daemon/config_format.zig`.
 
 ## Clean-room and no-legacy mandate
@@ -64,9 +64,9 @@ Orochi is a **clean-room, modern, inventive** IRC daemon. Do not port or copy le
 - `/OPER` command, oper passwords, host/IP masks, RSA challenge → **oper = SASL auth only** (certfp EXTERNAL / SCRAM).
 - server `PASS` as authentication → **SASL** (PASS may only select a connection class, never authenticate).
 - Exception: **LINKS / MAP are kept** (user decision 2026-06-02), but reimagined: they render the
-  **Suimyaku mesh** (nodes/peers), not a TS6 spanning tree. Implement them as mesh introspection.
+  **Undertow mesh** (nodes/peers), not a TS6 spanning tree. Implement them as mesh introspection.
 - ident / RFC1413 lookups → dead protocol; identity = TLS certfp / SASL.
-- TS6 / netburst / SJOIN / text S2S → **Suimyaku** binary CRDT mesh only.
+- TS6 / netburst / SJOIN / text S2S → **Undertow** binary CRDT mesh only.
 - Embedded Python / CPython modules → **WASM plugins** (OroWasm) or native Zig only. No Python.
 - DCC special-casing, legacy STATS letter soup, ctcp-flood quirks → omit or modernize.
 

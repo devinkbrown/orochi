@@ -23,7 +23,7 @@ There are **three distinct hybrid constructions** in the tree; do not conflate t
 |---|---|---|---|---|
 | **TLS `X25519MLKEM768`** (wire codepoint) | `tls_server.zig`, `tls_client.zig` | **raw concat**, no extra KDF | draft-ietf-tls-ecdhe-mlkem | **YES** |
 | **X-Wing KEM** | `xwing.zig` | `SHA3-256(ss_M‖ss_X‖ct_X‖pk_X‖label)` | draft-connolly-cfrg-xwing-kem-10 | **YES** |
-| **TSUMUGI mesh v2** (orochi-proprietary S2S) | `kx.zig` `HybridKx` | `HMAC(label, x_ss‖mlkem_ss‖transcript)` | orochi's own protocol — not an IETF codepoint | N/A (self-consistent) |
+| **MOORING mesh v2** (orochi-proprietary S2S) | `kx.zig` `HybridKx` | `HMAC(label, x_ss‖mlkem_ss‖transcript)` | orochi's own protocol — not an IETF codepoint | N/A (self-consistent) |
 
 The question asked specifically about the **TLS X25519MLKEM768 codepoint**; that path is
 `tls_server.zig`/`tls_client.zig`, **not** `kx.zig` and **not** `xwing.zig`. All three are
@@ -53,7 +53,7 @@ out.len = 64                 // raw 64-byte concat, fed to the TLS 1.3 key sched
 **Combined shared secret — server side** `src/crypto/tls_server.zig:1706-1710`: identical order
 (`out.buf[0..32] = enc.shared_secret` (ML-KEM), `out.buf[32..64] = x_ss`). The in-code comment at
 `tls_server.zig:1972-1975` explicitly notes this is "the RAW concatenation … NOT
-`kx.HybridKx.decapsulate`, which is the TSUMUGI mesh HKDF combiner." No additional KDF/hash is
+`kx.HybridKx.decapsulate`, which is the MOORING mesh HKDF combiner." No additional KDF/hash is
 applied to the 64-byte value before it enters the standard TLS 1.3 key schedule (it replaces the
 `(EC)DHE` secret input to HKDF-Extract). A loopback interop test exercises the whole path
 (`tls_server.zig:3606`, asserting the 64-byte "raw IETF concat" at `:3649`).
@@ -66,7 +66,7 @@ applied to the 64-byte value before it enters the standard TLS 1.3 key schedule 
 SHA3-256( ss_m || ss_x || ct_x || pk_x || xwing_label )
 ```
 Label `xwing.zig:48`: `"\x5c\x2e\x2f\x2f\x5e\x5c"` = bytes `5c 2e 2f 2f 5e 5c`. Used by the
-TSUMUGI mesh handshake/session (`tsumugi_handshake.zig`, `tsumugi_session.zig`,
+MOORING mesh handshake/session (`mooring_handshake.zig`, `mooring_session.zig`,
 `node_identity.zig`), **not** by the TLS layer.
 
 ### 1.3 ML-KEM-768 parameter provenance — VERIFIED
@@ -133,7 +133,7 @@ the FIPS-203 implementation; orochi binds to it. No round-3 Kyber parameter set 
 1. **Doc staleness (LOW):** `kx.zig:6` references "Zig 0.16 std"; toolchain is 0.17-dev. Comment
    only. Recommend a one-line fix when `kx.zig` is next touched.
 2. **Two combiner orders coexist by design (INFO, not a bug):** the TLS path concatenates
-   *ML-KEM-first*; the TSUMUGI mesh `HybridKx` HMACs *X25519-first*. They are different protocols;
+   *ML-KEM-first*; the MOORING mesh `HybridKx` HMACs *X25519-first*. They are different protocols;
    neither leaks into the other (the code comment at `tls_server.zig:1972-1975` guards against the
    confusion). No action needed, but worth a note for future reviewers.
 3. **Spec is a moving WG draft (MONITOR):** draft-ietf-tls-ecdhe-mlkem is not an RFC. The `0x11EC`

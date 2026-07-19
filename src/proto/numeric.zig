@@ -16,7 +16,7 @@ pub const Numeric = enum(u16) {
     RPL_MYINFO = 4,
     RPL_ISUPPORT = 5,
     // RPL_SNOMASK (8) / RPL_REDIR (10) removed: snomask rides the Event Spine,
-    // server-bounce is gone. MAP is KEPT — reimagined to render the Suimyaku
+    // server-bounce is gone. MAP is KEPT — reimagined to render the Undertow
     // mesh topology (nodes/peers) rather than a TS6 spanning tree.
     RPL_MAP = 15,
     RPL_MAPMORE = 16,
@@ -121,7 +121,7 @@ pub const Numeric = enum(u16) {
     RPL_KILLDONE = 361,
     RPL_CLOSING = 362,
     RPL_CLOSEEND = 363,
-    // LINKS is KEPT — reimagined to list Suimyaku mesh peers (not a spanning
+    // LINKS is KEPT — reimagined to list Undertow mesh peers (not a spanning
     // tree). See also RPL_MAP (15-17).
     RPL_LINKS = 364,
     RPL_ENDOFLINKS = 365,

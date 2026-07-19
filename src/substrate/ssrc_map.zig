@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Allocation-free bidirectional identity map for the Kakehashi SFU media bridge.
+//! Allocation-free bidirectional identity map for the Causeway SFU media bridge.
 //!
 //! Translates between the native media stream identity (`stream_id: u32` carried
-//! by kagura frames) and the WebRTC RTP `ssrc: u32`, while tracking the
+//! by cadence frames) and the WebRTC RTP `ssrc: u32`, while tracking the
 //! participant that owns each binding. Pure, std-only, fixed capacity — no
 //! allocation, no hidden state.
 
@@ -136,7 +136,7 @@ pub fn SsrcMap(comptime capacity: usize) type {
     };
 }
 
-/// Default sizing for the Kakehashi bridge.
+/// Default sizing for the Causeway bridge.
 pub const Map = SsrcMap(256);
 
 test "bind and resolve both directions plus participant lookups" {

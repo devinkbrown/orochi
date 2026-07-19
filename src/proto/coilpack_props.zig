@@ -61,9 +61,9 @@ fn expectHeaderOkOrError(input: []const u8) !void {
         return;
     };
 
-    var out: [coilpack.suimyaku_header_len]u8 = undefined;
-    try std.testing.expectEqual(coilpack.suimyaku_header_len, try coilpack.encodeHeader(&out, decoded));
-    try std.testing.expect(coilpack.canonicalEqual(input[0..coilpack.suimyaku_header_len], &out));
+    var out: [coilpack.undertow_header_len]u8 = undefined;
+    try std.testing.expectEqual(coilpack.undertow_header_len, try coilpack.encodeHeader(&out, decoded));
+    try std.testing.expect(coilpack.canonicalEqual(input[0..coilpack.undertow_header_len], &out));
 }
 
 fn expectReaderOkOrError(input: []const u8) !void {
@@ -303,7 +303,7 @@ test "random valid values round-trip and re-encode canonically" {
                 try std.testing.expect(coilpack.canonicalEqual(writer.written(), rewrite.written()));
             },
             else => {
-                const header = coilpack.SuimyakuHeader{
+                const header = coilpack.UndertowHeader{
                     .type = random.int(u8),
                     .ctrl = random.int(u8),
                     .length = random.int(u16),
@@ -363,7 +363,7 @@ test "every prefix of valid encodings is truncated or canonical" {
                     .stream_id = random.int(u24),
                     .hop = random.int(u8),
                 });
-                writer.pos += coilpack.suimyaku_header_len;
+                writer.pos += coilpack.undertow_header_len;
             },
             else => {
                 _ = try writer.writeU8(random.int(u8));

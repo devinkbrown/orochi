@@ -234,7 +234,7 @@ test "round-trip with non-null vhost and realistic hash/salt" {
     };
 
     const original = AccountCapsule{
-        .account = "Suimyaku",
+        .account = "Undertow",
         .pass_hash = &hash,
         .salt = &salt,
         .iterations = 100_000,

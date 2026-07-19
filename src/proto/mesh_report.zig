@@ -32,7 +32,7 @@ pub const MeshSnapshot = struct {
     peers: []const PeerLink,
     reachable_nodes: u32 = 0,
     partitioned_nodes: u32 = 0,
-    /// Goryu root hash, usually a short hex prefix.
+    /// Concord root hash, usually a short hex prefix.
     root_hash_hex: []const u8 = "",
 };
 

@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Native media plane — the Suimyaku-side SFU forwarding core, transport-neutral.
+//! Native media plane — the Undertow-side SFU forwarding core, transport-neutral.
 //!
 //! Composes the existing native pieces into one forward decision: the
-//! `suimyaku.media.Session` roster (who publishes/receives) + per-receiver
-//! simulcast layer selection (`kagura_layer.shouldForward`). It answers "for an
-//! inbound native kagura frame from X, which participants should receive it,
+//! `undertow.media.Session` roster (who publishes/receives) + per-receiver
+//! simulcast layer selection (`cadence_layer.shouldForward`). It answers "for an
+//! inbound native cadence frame from X, which participants should receive it,
 //! after dropping layers above each receiver's selection?" — and the server
 //! forwards the SAME opaque frame bytes to them. NO encode/decode/transcode: a
 //! receiver either gets the frame verbatim or it is dropped for being a higher
@@ -16,8 +16,8 @@
 //! whatever native datagram transport (ryusen/CoilPack) carries the frames — the
 //! plane only makes the forwarding decision.
 const std = @import("std");
-const media = @import("suimyaku/media.zig");
-const kagura_layer = @import("kagura_layer.zig");
+const media = @import("undertow/media.zig");
+const cadence_layer = @import("cadence_layer.zig");
 
 pub const ParticipantId = media.ParticipantId;
 pub const MediaKind = media.MediaKind;
@@ -87,7 +87,7 @@ pub fn NativeMediaPlane(comptime max_participants: usize) type {
             out: []ParticipantId,
         ) usize {
             const fs = self.session.forwardSet(source_id, kind, .{}) catch return 0;
-            const info = kagura_layer.LayerInfo{
+            const info = cadence_layer.LayerInfo{
                 .spatial = frame_spatial,
                 .temporal = frame_temporal,
                 .keyframe = keyframe,
@@ -96,7 +96,7 @@ pub fn NativeMediaPlane(comptime max_participants: usize) type {
             var n: usize = 0;
             for (fs.recipients[0..fs.len]) |rid| {
                 const sel = self.selectionFor(rid);
-                if (!kagura_layer.shouldForward(info, sel.max_spatial, sel.max_temporal)) continue;
+                if (!cadence_layer.shouldForward(info, sel.max_spatial, sel.max_temporal)) continue;
                 if (n >= out.len) break;
                 out[n] = rid;
                 n += 1;
@@ -107,8 +107,8 @@ pub fn NativeMediaPlane(comptime max_participants: usize) type {
 }
 
 // ---------------------------------------------------------------------------
-// Tests (run under the unified build; transitively imports kagura via the
-// suimyaku media module, so not standalone `zig test`-able — expected).
+// Tests (run under the unified build; transitively imports cadence via the
+// undertow media module, so not standalone `zig test`-able — expected).
 // ---------------------------------------------------------------------------
 
 const testing = std.testing;

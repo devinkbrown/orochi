@@ -1,11 +1,11 @@
 # Native-media per-datagram MAC — client contract
 
-*The client contract for authenticating Kagura-frame native media datagrams end to end.*
+*The client contract for authenticating Cadence-frame native media datagrams end to end.*
 
-Orochi can authenticate each native media transport (KaguraVox/KaguraVis)
+Orochi can authenticate each native media transport (CadenceVox/CadenceVis)
 datagram with a keyed MAC, so a forged or tampered datagram is dropped before
 the SFU learns the sender, meters it, or forwards it. Source of truth:
-`src/substrate/kagura_frame.zig`, `src/daemon/native_media_transport.zig`,
+`src/substrate/cadence_frame.zig`, `src/daemon/native_media_transport.zig`,
 `src/daemon/server.zig`, and `src/substrate/native_feedback.zig`.
 
 ## Activation
@@ -14,7 +14,7 @@ Server config `[media].native_media_require_mac` (default `false`;
 `src/daemon/config_format.zig:464-466`):
 
 - `false` — untagged datagrams are accepted (back-compat); a valid tagged datagram
-  is also accepted and forwarded (`src/substrate/kagura_frame.zig:320-333`).
+  is also accepted and forwarded (`src/substrate/cadence_frame.zig:320-333`).
 - `true` — untagged or bad-tag datagrams are dropped before address learning
   (`src/daemon/native_media_transport.zig:170-177`,
   `src/daemon/native_media_transport.zig:240-253`).
@@ -30,14 +30,14 @@ relay participant joins (`src/daemon/server.zig:26229-26233`,
 
 ## Media frame wire format
 
-A 16-byte MAC tag is appended after the Kagura frame; it is not included in the
-frame's `payload-length` prefix (`src/substrate/kagura_frame.zig:68-70`,
-`src/substrate/kagura_frame.zig:197-205`):
+A 16-byte MAC tag is appended after the Cadence frame; it is not included in the
+frame's `payload-length` prefix (`src/substrate/cadence_frame.zig:68-70`,
+`src/substrate/cadence_frame.zig:197-205`):
 
 ```text
 [ 4-byte payload-length (LE u32) ]  ─┐
 [ 1-byte band_id                 ]   │
-[ 4-byte stream_id  (LE u32)     ]   │  kagura_frame_bytes
+[ 4-byte stream_id  (LE u32)     ]   │  cadence_frame_bytes
 [ 4-byte sequence   (LE u32)     ]   │  (the MAC input)
 [ 8-byte timestamp  (LE u64)     ]   │
 [ 1-byte flags                   ]   │
@@ -49,19 +49,19 @@ frame's `payload-length` prefix (`src/substrate/kagura_frame.zig:68-70`,
 ## MAC algorithm
 
 ```text
-mac_tag = HMAC-SHA256(mac_key, kagura_frame_bytes)[0..16]
+mac_tag = HMAC-SHA256(mac_key, cadence_frame_bytes)[0..16]
 ```
 
-`kagura_frame_bytes` is the exact frame before the tag: the 4-byte length prefix,
-the 19-byte Kagura header, and the payload. Verification uses a constant-time
-compare (`src/substrate/kagura_frame.zig:281-284`,
-`src/substrate/kagura_frame.zig:287-297`, `src/substrate/kagura_frame.zig:312-315`).
+`cadence_frame_bytes` is the exact frame before the tag: the 4-byte length prefix,
+the 19-byte Cadence header, and the payload. Verification uses a constant-time
+compare (`src/substrate/cadence_frame.zig:281-284`,
+`src/substrate/cadence_frame.zig:287-297`, `src/substrate/cadence_frame.zig:312-315`).
 
 ## MAC key derivation
 
 HKDF-style extract-then-expand from the existing per-process native stream-id
 PRF root (`native_stream_key`); the 32-bit `stream_id` is not key material
-(`src/daemon/server.zig:2789-2794`, `src/substrate/kagura_frame.zig:248-268`):
+(`src/daemon/server.zig:2789-2794`, `src/substrate/cadence_frame.zig:248-268`):
 
 ```text
 PRK     = HMAC-SHA256("orochi native-media mac extract v1", native_stream_key)
@@ -75,17 +75,17 @@ mac_key = HMAC-SHA256(
 `channel` and `participant` are the same public values used for that participant's
 native stream-id capability, and the explicit `0x00` / `0x01` bytes separate the
 derivation fields (`src/daemon/server.zig:26758-26767`,
-`src/substrate/kagura_frame.zig:261-268`).
+`src/substrate/cadence_frame.zig:261-268`).
 
 ## Verification behavior
 
-`acceptNativeMediaMac` first uses the Kagura frame length prefix to split the
+`acceptNativeMediaMac` first uses the Cadence frame length prefix to split the
 declared frame from any outer tag. An untagged datagram is accepted only when
 `require_tag` is false; when `require_tag` is true it fails with `MissingTag`.
 Any trailing length other than exactly one 16-byte tag fails with `TrailingBytes`
-(`src/substrate/kagura_frame.zig:320-333`). A present tag is recomputed over the
+(`src/substrate/cadence_frame.zig:320-333`). A present tag is recomputed over the
 exact frame bytes and compared in constant time; mismatches fail with `BadTag`
-(`src/substrate/kagura_frame.zig:300-315`).
+(`src/substrate/cadence_frame.zig:300-315`).
 
 The native transport pump authenticates the datagram before calling
 `inboundFrom`, which is the path that learns the sender address, meters the
@@ -104,7 +104,7 @@ tags fail closed before address learning or forwarding
 ## Native feedback envelope
 
 Native control-plane feedback is always authenticated, independent of
-`native_media_require_mac`, and is not encoded as a Kagura media frame. Clients
+`native_media_require_mac`, and is not encoded as a Cadence media frame. Clients
 wrap `native_feedback` payloads in this envelope
 (`src/substrate/native_feedback.zig:46-50`, `src/substrate/native_feedback.zig:161-176`):
 

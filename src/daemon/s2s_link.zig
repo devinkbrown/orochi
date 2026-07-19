@@ -20,15 +20,15 @@
 //!   const out = link.outbound();     // send these bytes, then link.clearOutbound()
 const std = @import("std");
 
-const s2s_peer = @import("../substrate/suimyaku/s2s_peer.zig");
-const signed_frame = @import("../substrate/suimyaku/signed_frame.zig");
-const partition_detector = @import("../substrate/suimyaku/partition_detector.zig");
+const s2s_peer = @import("../substrate/undertow/s2s_peer.zig");
+const signed_frame = @import("../substrate/undertow/signed_frame.zig");
+const partition_detector = @import("../substrate/undertow/partition_detector.zig");
 const s2s_frame = @import("../proto/s2s_frame.zig");
 const sign = @import("../crypto/sign.zig");
 const channel_mode_state_event = @import("../proto/channel_mode_state_event.zig");
 const entity_prop_event = @import("../proto/entity_prop_event.zig");
 const meshpass = @import("../proto/meshpass.zig");
-const message_relay_v2 = @import("../substrate/suimyaku/message_relay_v2.zig");
+const message_relay_v2 = @import("../substrate/undertow/message_relay_v2.zig");
 
 /// Cross-node relay message types (re-exported at module scope for the daemon).
 pub const RelayMessage = s2s_peer.RelayMessage;
@@ -38,8 +38,8 @@ pub const RelayVerbV2 = s2s_peer.RelayVerbV2;
 pub const InboundMessageV2 = s2s_peer.InboundMessageV2;
 pub const SignedOperEventV2 = s2s_peer.SignedOperEventV2;
 pub const InboundOperEventV2 = s2s_peer.InboundOperEventV2;
-const channel_crdt = @import("../substrate/suimyaku/channel_crdt.zig");
-const peer_link = @import("../substrate/suimyaku/peer_link.zig");
+const channel_crdt = @import("../substrate/undertow/channel_crdt.zig");
+const peer_link = @import("../substrate/undertow/peer_link.zig");
 
 pub const NodeId = s2s_peer.NodeId;
 pub const NickClaim = s2s_peer.NickClaim;
@@ -59,8 +59,8 @@ pub const Options = struct {
     local_epoch_ms: u64,
     server_name: []const u8,
     description: []const u8 = "",
-    channel_name: []const u8 = "#suimyaku",
-    /// Suimyaku peer-driver limits/timers/capacities from daemon config.
+    channel_name: []const u8 = "#undertow",
+    /// Undertow peer-driver limits/timers/capacities from daemon config.
     config: s2s_peer.Config = .{},
     now_ms: u64 = 0,
     /// Optional node Ed25519 signing keypair for end-to-end origin
@@ -75,11 +75,11 @@ pub const Options = struct {
     /// preserves open/shared-secret behavior.
     admitted_frame_families: u32 = 0,
     /// Internal outer-transport assertion. Only `SecuredLink` sets this after a
-    /// successful Tsumugi AKE; standalone/plaintext links must leave it false.
+    /// successful Mooring AKE; standalone/plaintext links must leave it false.
     session_replica_transport_enabled: bool = false,
-    /// Independent Tsumugi transport assertion for secure relay v2.
+    /// Independent Mooring transport assertion for secure relay v2.
     secure_relay_transport_enabled: bool = false,
-    /// Independent Tsumugi transport assertion for Event Spine v2.
+    /// Independent Mooring transport assertion for Event Spine v2.
     event_spine_v2_transport_enabled: bool = false,
 };
 

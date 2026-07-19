@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Probabilistic sketches for SUIMYAKU anti-entropy planning.
+//! Probabilistic sketches for UNDERTOW anti-entropy planning.
 //!
 //! Bloom filters and HyperLogLog counters are intentionally domain separated:
-//! callers provide a salt derived from the SUIMYAKU frame type and mesh epoch so
+//! callers provide a salt derived from the UNDERTOW frame type and mesh epoch so
 //! the same input hash cannot be reused across protocols or epochs.
 const std = @import("std");
 

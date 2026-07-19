@@ -185,7 +185,7 @@ pub const Transport = enum {
     tcp,
     tls,
     websocket,
-    suimyaku,
+    undertow,
 };
 
 pub const AddressFamily = enum {

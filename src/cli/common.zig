@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Shared plumbing for the `yoroi` command-line toolkit: capped input loading
+//! Shared plumbing for the `armor` command-line toolkit: capped input loading
 //! (file or stdin), PEM/DER auto-detection, hex/fingerprint formatting, OID
 //! pretty-naming, and the 0o600 private-key file writer. Every helper is a
 //! thin front-end over the existing substrate (src/proto/pem.zig,
@@ -86,7 +86,7 @@ pub fn writeColonHex(w: *Writer, bytes: []const u8) Writer.Error!void {
     }
 }
 
-/// Human name for the signature/key AlgorithmIdentifier OIDs the Yoroi stack
+/// Human name for the signature/key AlgorithmIdentifier OIDs the Armor stack
 /// emits or accepts. Display-only; identity decisions always compare raw OIDs.
 pub fn oidName(oid: []const u8) []const u8 {
     const Named = struct { oid: []const u8, name: []const u8 };
@@ -181,7 +181,7 @@ pub const ArgCursor = struct {
 
 const testing = std.testing;
 
-test "yoroicli loadDer decodes a PEM block and passes DER through" {
+test "armorcli loadDer decodes a PEM block and passes DER through" {
     const gpa = testing.allocator;
     // Arrange: a tiny DER SEQUENCE wrapped in a PEM block.
     const der = [_]u8{ 0x30, 0x03, 0x02, 0x01, 0x2a };
@@ -199,13 +199,13 @@ test "yoroicli loadDer decodes a PEM block and passes DER through" {
     try testing.expectEqualSlices(u8, &der, from_der);
 }
 
-test "yoroicli loadDer fails closed on a PEM block with the wrong label" {
+test "armorcli loadDer fails closed on a PEM block with the wrong label" {
     const gpa = testing.allocator;
     const text = "-----BEGIN PRIVATE KEY-----\nMAMCASo=\n-----END PRIVATE KEY-----\n";
     try testing.expectError(error.BeginNotFound, loadDer(gpa, text, "CERTIFICATE", .auto));
 }
 
-test "yoroicli oid helpers render known and unknown OIDs" {
+test "armorcli oid helpers render known and unknown OIDs" {
     var aw = Writer.Allocating.init(testing.allocator);
     defer aw.deinit();
 
@@ -222,7 +222,7 @@ test "yoroicli oid helpers render known and unknown OIDs" {
     try testing.expect(std.mem.endsWith(u8, aw.written(), "<bad-oid>"));
 }
 
-test "yoroicli writeKeyFile writes the private key owner-only (0o600)" {
+test "armorcli writeKeyFile writes the private key owner-only (0o600)" {
     if (builtin.os.tag != .linux) return error.SkipZigTest;
     const io = std.testing.io;
 

@@ -254,7 +254,7 @@ pub fn build(b: *std.Build) void {
         .filters = tls_test_filters,
     });
     const run_tls_tests = b.addRunArtifact(tls_tests);
-    const test_tls_step = b.step("test-tls", "Run focused Yoroi TLS, mTLS, ECH, RPK, DC, and record-size tests");
+    const test_tls_step = b.step("test-tls", "Run focused Armor TLS, mTLS, ECH, RPK, DC, and record-size tests");
     test_tls_step.dependOn(&run_tls_tests.step);
     const tls_tests_verbose = b.addTest(.{
         .root_module = mod,
@@ -389,7 +389,7 @@ pub fn build(b: *std.Build) void {
         "mesh",
         "Mesh",
         "secured link",
-        "Suimyaku",
+        "Undertow",
         "REPAIR",
         "repair",
         "squit",
@@ -400,7 +400,7 @@ pub fn build(b: *std.Build) void {
         .filters = mesh_test_filters,
     });
     const run_mesh_tests = b.addRunArtifact(mesh_tests);
-    const test_mesh_step = b.step("test-mesh", "Run focused Suimyaku mesh, S2S, repair, and secured-link tests");
+    const test_mesh_step = b.step("test-mesh", "Run focused Undertow mesh, S2S, repair, and secured-link tests");
     test_mesh_step.dependOn(&run_mesh_tests.step);
     const mesh_tests_verbose = b.addTest(.{
         .root_module = mod,
@@ -526,13 +526,13 @@ pub fn build(b: *std.Build) void {
     const test_helix_verbose_step = b.step("test-helix-verbose", "Run focused Helix/upgrade tests with per-test progress output");
     test_helix_verbose_step.dependOn(&run_helix_tests_verbose.step);
 
-    // `yoroi` — the standalone Yoroi crypto toolkit CLI (openssl-parity verbs,
+    // `armor` — the standalone Armor crypto toolkit CLI (openssl-parity verbs,
     // every one a thin front-end over the src/crypto substrate). Declared like
     // the daemon executable: its own root module importing "orochi".
-    const yoroi_exe = b.addExecutable(.{
-        .name = "yoroi",
+    const armor_exe = b.addExecutable(.{
+        .name = "armor",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/cli/yoroi_main.zig"),
+            .root_source_file = b.path("src/cli/armor_main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = needs_libc,
@@ -542,22 +542,22 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(yoroi_exe);
+    b.installArtifact(armor_exe);
 
     const cli_tests = b.addTest(.{
-        .root_module = yoroi_exe.root_module,
+        .root_module = armor_exe.root_module,
         .filters = test_filters,
     });
     const run_cli_tests = b.addRunArtifact(cli_tests);
-    const test_cli_step = b.step("test-cli", "Run the yoroi CLI toolkit tests; accepts -Dtest-filter=<text>");
+    const test_cli_step = b.step("test-cli", "Run the armor CLI toolkit tests; accepts -Dtest-filter=<text>");
     test_cli_step.dependOn(&run_cli_tests.step);
     const cli_tests_verbose = b.addTest(.{
-        .root_module = yoroi_exe.root_module,
+        .root_module = armor_exe.root_module,
         .filters = test_filters,
         .test_runner = verbose_test_runner,
     });
     const run_cli_tests_verbose = b.addRunArtifact(cli_tests_verbose);
-    const test_cli_verbose_step = b.step("test-cli-verbose", "Run yoroi CLI tests with per-test progress output");
+    const test_cli_verbose_step = b.step("test-cli-verbose", "Run armor CLI tests with per-test progress output");
     test_cli_verbose_step.dependOn(&run_cli_tests_verbose.step);
 
     // A top level step for running all tests. dependOn can be called multiple
@@ -572,13 +572,13 @@ pub fn build(b: *std.Build) void {
     test_verbose_step.dependOn(&run_exe_tests_verbose.step);
     test_verbose_step.dependOn(&run_cli_tests_verbose.step);
 
-    // `zig build wasm` — compile the KaguraVox/KaguraVis codecs to a freestanding
+    // `zig build wasm` — compile the CadenceVox/CadenceVis codecs to a freestanding
     // WASM module for the in-browser client (#11/#32). Pure-integer +
     // allocation-free, so it needs no WASI/libc; the JS side drives it through
     // linear memory.
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     const wasm_mod = b.createModule(.{
-        .root_source_file = b.path("src/wasm/kagura_wasm.zig"),
+        .root_source_file = b.path("src/wasm/cadence_wasm.zig"),
         .target = wasm_target,
         .optimize = .ReleaseSmall,
         .strip = true,
@@ -586,11 +586,11 @@ pub fn build(b: *std.Build) void {
     // The codecs depend only on std, so expose them as standalone wasm-targeted
     // modules (the full orochi root pulls in io_uring/sockets and won't build
     // freestanding).
-    const wasm_kaguravox = b.createModule(.{ .root_source_file = b.path("src/substrate/kaguravox_adpcm.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
-    const wasm_kaguravis = b.createModule(.{ .root_source_file = b.path("src/substrate/kaguravis_delta.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
-    wasm_mod.addImport("kaguravox_adpcm", wasm_kaguravox);
-    wasm_mod.addImport("kaguravis_delta", wasm_kaguravis);
-    const wasm = b.addExecutable(.{ .name = "kagura", .root_module = wasm_mod });
+    const wasm_cadencevox = b.createModule(.{ .root_source_file = b.path("src/substrate/cadencevox_adpcm.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
+    const wasm_cadencevis = b.createModule(.{ .root_source_file = b.path("src/substrate/cadencevis_delta.zig"), .target = wasm_target, .optimize = .ReleaseSmall, .strip = true });
+    wasm_mod.addImport("cadencevox_adpcm", wasm_cadencevox);
+    wasm_mod.addImport("cadencevis_delta", wasm_cadencevis);
+    const wasm = b.addExecutable(.{ .name = "cadence", .root_module = wasm_mod });
     wasm.entry = .disabled; // a library of exports, not an entry-point program
     wasm.rdynamic = true; // keep the `export fn`s in the final module
     const wasm_step = b.step("wasm", "Build the Ocean browser WASM modules");
@@ -765,7 +765,7 @@ pub fn build(b: *std.Build) void {
     // `zig build bogo-shim` — the roadmap-0.3 BoGo shim: a standalone tool that
     // speaks BoringSSL's `ssl/test/runner` shim contract (dial the runner's TCP
     // port, drive orochi's TlsConn/tls_client engine, XOR-echo, exit 0/89/nonzero)
-    // so the external Go harness can protocol-test the Yoroi TLS stack. Kept out
+    // so the external Go harness can protocol-test the Armor TLS stack. Kept out
     // of `zig build test` (it's a separate harness, not a unit-test module) and
     // linked to nothing in the daemon — it reuses the engines via the shared
     // `orochi` module exactly as `tools/quic_interop_server.zig` does.

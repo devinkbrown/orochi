@@ -19,13 +19,13 @@
 //! roster: the successor stood the inner link up with an empty replica and the
 //! RESYNC refilled it, which is what re-announced every member as `.joined`.)
 //!
-//! SECURITY: the encoded bytes contain the live Tsumugi directional record keys.
+//! SECURITY: the encoded bytes contain the live Mooring directional record keys.
 //! They only ever live inside the sealed memfd arena inherited by the successor —
 //! never on disk.
 //!
 //! Wire format (all integers little-endian):
 //!   [i32 fd]
-//!   [u8 role]            0 = initiator, 1 = responder (outer Tsumugi role)
+//!   [u8 role]            0 = initiator, 1 = responder (outer Mooring role)
 //!   [u8 s2s_initiator]   1 if THIS node dialed the link (collision resolution)
 //!   [N established]      Established.serialized_len bytes: record keys + peer id
 //!                        (schema v1 blobs are 4 bytes shorter here — they predate
@@ -56,7 +56,7 @@
 //!                           total; decode validates the walk fail-closed
 const std = @import("std");
 
-const hs = @import("../../crypto/tsumugi_handshake.zig");
+const hs = @import("../../crypto/mooring_handshake.zig");
 const s2s_frame = @import("../../proto/s2s_frame.zig");
 
 pub const Error = error{
@@ -742,7 +742,7 @@ test "s2s link snapshot v4 capsule carries the converged roster across a Helix u
     });
     // A minimal identity-less member stored under a collision loser-UID alias.
     try appendRosterMember(allocator, &roster, .{
-        .channel = "#suimyaku",
+        .channel = "#undertow",
         .nick = "u1000AAAAA",
         .node = 3,
         .status = 0,
@@ -779,7 +779,7 @@ test "s2s link snapshot v4 capsule carries the converged roster across a Helix u
     try testing.expectEqualStrings("aa:bb:cc", m0.certfp);
     try testing.expectEqualSlices(u8, &tok, &m0.session_token.?);
     const m1 = (try it.next()).?;
-    try testing.expectEqualStrings("#suimyaku", m1.channel);
+    try testing.expectEqualStrings("#undertow", m1.channel);
     try testing.expectEqualStrings("u1000AAAAA", m1.nick);
     try testing.expectEqual(@as(u64, 3), m1.node);
     try testing.expectEqual(@as(u4, 0), m1.status);

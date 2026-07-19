@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! `yoroi asn1parse` — DER structure dump using the substrate's strict,
+//! `armor asn1parse` — DER structure dump using the substrate's strict,
 //! bounds-checked walker (src/crypto/x509.zig `DerReader`, which enforces
 //! canonical lengths, depth caps, and the 1 MiB ceiling). This module only
 //! formats what the reader yields; a malformed input surfaces the reader's
@@ -26,7 +26,7 @@ pub const Options = struct {
 
 pub fn usage(w: *Writer) Writer.Error!void {
     try w.writeAll(
-        \\usage: yoroi asn1parse [-in <path>] [-inform pem|der] [-label <name>]
+        \\usage: armor asn1parse [-in <path>] [-inform pem|der] [-label <name>]
         \\  -in <path>        input (PEM or DER; default stdin)
         \\  -inform pem|der   force the input encoding (default: auto-detect)
         \\  -label <name>     PEM label to select (default: first block)
@@ -159,7 +159,7 @@ pub fn run(gpa: Allocator, io: std.Io, opts: Options, out: *Writer) !void {
 
 const testing = std.testing;
 
-test "yoroicli asn1parse dumps a nested structure with offsets and OIDs" {
+test "armorcli asn1parse dumps a nested structure with offsets and OIDs" {
     // SEQUENCE { INTEGER 42, SEQUENCE { OID 1.3.101.112 }, UTF8STRING "hi" }
     const der = [_]u8{
         0x30, 0x0e,
@@ -185,7 +185,7 @@ test "yoroicli asn1parse dumps a nested structure with offsets and OIDs" {
     try testing.expect(std.mem.startsWith(u8, got, "     0: d=0"));
 }
 
-test "yoroicli asn1parse fails closed on malformed DER" {
+test "armorcli asn1parse fails closed on malformed DER" {
     var aw = Writer.Allocating.init(testing.allocator);
     defer aw.deinit();
 

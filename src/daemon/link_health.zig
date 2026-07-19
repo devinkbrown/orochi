@@ -13,7 +13,7 @@
 //! never reads the system clock.
 const std = @import("std");
 
-/// Lifecycle state of a mesh peer link. Names mirror the Suimyaku link state
+/// Lifecycle state of a mesh peer link. Names mirror the Undertow link state
 /// machine (idle -> handshaking -> established -> draining) so values map 1:1
 /// onto the mesh report enum, with `connecting` covering pre-handshake dialing
 /// and `down` covering a closed/dead link.
