@@ -512,7 +512,12 @@ class Bot:
         self.enqueue(f"NOTICE {target} :{text}")
 
     def channel_say(self, text: str, *, immediate: bool = False) -> None:
-        """Speak in ANNOUNCE_CHANNEL. immediate=True bypasses the pace queue."""
+        """Speak in ANNOUNCE_CHANNEL. immediate=True bypasses the pace queue.
+
+        Also enqueues a color-stripped plain twin when the line has mIRC codes,
+        so clients still see the text if mesh admit rejects formatted payloads
+        or a client strips formatting poorly. Colored line is preferred first.
+        """
         text = (text or "").strip()
         if not text:
             log.warning("refusing empty channel message")
@@ -526,6 +531,15 @@ class Bot:
             self.last_send = time.time()
         else:
             self.enqueue(line)
+        # Plain fallback only when formatting present (avoid double spam).
+        if "\x03" in text or "\x02" in text or "\x1f" in text:
+            plain = re.sub(r"\x03\d{0,2}(?:,\d{1,2})?|[\x02\x1f\x0f\x16]", "", text)
+            plain = re.sub(r"\s+", " ", plain).strip()
+            if plain and plain != text:
+                while byte_len(plain) > MAX_MESSAGE_TEXT_BYTES:
+                    plain = plain[: max(1, len(plain) - 8)].rstrip() + "…"
+                # Pace the plain twin after the colored line.
+                self.enqueue(f"PRIVMSG {CHANNEL} :{plain}")
 
     def channel_notice(self, text: str) -> None:
         text = (text or "").strip()

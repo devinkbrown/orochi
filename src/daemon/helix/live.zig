@@ -263,6 +263,15 @@ pub const max_inherited_listeners = 64;
 /// a successor can close the sockets even when the arena is corrupt or uses a
 /// future schema that it cannot decode.
 pub const env_state_fds = "ONYX_HELIX_STATE_FDS";
+// Legacy Orochi-branded names. A pre-rename predecessor only emits these; the
+// successor MUST accept them or USR2 becomes a cold restart that drops every
+// session. New handoffs always emit ONYX_ names; remove the aliases only after
+// no Orochi predecessor remains in the fleet.
+const env_arena_fd_legacy = "OROCHI_HELIX_ARENA_FD";
+const env_control_fd_legacy = "OROCHI_HELIX_CONTROL_FD";
+const env_listen_fd_legacy = "OROCHI_HELIX_LISTEN_FD";
+const env_listen_fds_legacy = "OROCHI_HELIX_LISTEN_FDS";
+const env_state_fds_legacy = "OROCHI_HELIX_STATE_FDS";
 /// Hard cap for the authoritative state-fd manifest. Both producer and parser
 /// reject lists above this bound; the list is never silently truncated because
 /// losing even one fd would strand that connection across a refused upgrade.
@@ -275,17 +284,29 @@ pub const max_inherited_state_fds = 4096;
 /// `clients-v5` promises exact client-tail validation through the canonical
 /// `was_websocket` discriminator; a target lacking it must never receive fds.
 pub const upgrade_capability_arg = "--helix-upgrade-capabilities-v1";
+/// Caps list shared by current and legacy-branded tokens. The set of Helix
+/// handoff contracts must stay identical; only the product prefix differs.
+const upgrade_capability_caps =
+    "attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2";
 pub const upgrade_capability_token =
-    "ONYX_HELIX_UPGRADE_CAPS=attachment-delivery-spool-v1,clients-v5,handoff-manifest-v1,history-v1,mesh-checkpoint-v2,mesh-clock-v3,property-state-v2,relay-v2-event-log-v1,relay-v2-outbox-v2,state-fd-manifest-v1,webhook-store-v1,world-v2";
+    "ONYX_HELIX_UPGRADE_CAPS=" ++ upgrade_capability_caps;
+/// Pre-rename (Orochi) predecessor binaries match this exact line when probing
+/// a successor. Emitted alongside the ONYX token so a live Orochi node can
+/// USR2 into an Onyx Server image without cold restart. Remove only after every
+/// production node has already been through one ONYX-branded successor.
+pub const upgrade_capability_token_legacy_orochi =
+    "OROCHI_HELIX_UPGRADE_CAPS=" ++ upgrade_capability_caps;
 
 /// Require the capability token as a complete output line. Substring matching
 /// would let a diagnostic such as "missing TOKEN" accidentally authorize a
-/// handoff to an incompatible image.
+/// handoff to an incompatible image. Accept either brand during the rename
+/// window so mixed-fleet USR2 still works.
 pub fn hasUpgradeCapabilityLine(output: []const u8) bool {
     var lines = std.mem.splitScalar(u8, output, '\n');
     while (lines.next()) |raw| {
         const line = std.mem.trimEnd(u8, raw, "\r");
         if (std.mem.eql(u8, line, upgrade_capability_token)) return true;
+        if (std.mem.eql(u8, line, upgrade_capability_token_legacy_orochi)) return true;
     }
     return false;
 }
@@ -608,13 +629,18 @@ pub fn resumeFromEnv() ?Resume {
 }
 
 fn resumeFromEnvBlock(env: []const u8) ?Resume {
-    const arena_fd = readFdFromEnvBlock(env, env_arena_fd);
-    const control_fd = readFdFromEnvBlock(env, env_control_fd);
-    const listen_fd = readFdFromEnvBlock(env, env_listen_fd);
-    const state_fd_value = findEnvValue(env, env_state_fds);
+    // Prefer ONYX_ names; fall back to OROCHI_ for one rename-window upgrade.
+    const arena_fd = readFdFromEnvBlock(env, env_arena_fd) orelse
+        readFdFromEnvBlock(env, env_arena_fd_legacy);
+    const control_fd = readFdFromEnvBlock(env, env_control_fd) orelse
+        readFdFromEnvBlock(env, env_control_fd_legacy);
+    const listen_fd = readFdFromEnvBlock(env, env_listen_fd) orelse
+        readFdFromEnvBlock(env, env_listen_fd_legacy);
+    const state_fd_value = findEnvValue(env, env_state_fds) orelse
+        findEnvValue(env, env_state_fds_legacy);
     if (arena_fd == null and control_fd == null and listen_fd == null and state_fd_value == null) return null;
     var r: Resume = .{ .arena_fd = arena_fd, .control_fd = control_fd, .listen_fd = listen_fd };
-    if (findEnvValue(env, env_listen_fds)) |list| {
+    if (findEnvValue(env, env_listen_fds) orelse findEnvValue(env, env_listen_fds_legacy)) |list| {
         r.listen_fd_count = parseFdList(list, &r.listen_fds);
     }
     if (state_fd_value) |list| {

@@ -143,9 +143,45 @@ fn hasControl(bytes: []const u8) bool {
     return false;
 }
 
+/// IRC message bodies intentionally carry mIRC/IRCv3 formatting C0 codes
+/// (bold/colour/reset/italic/underline/…). Those are content, not protocol
+/// framing. CR/LF/NUL (and other non-format C0 / DEL) remain forbidden so a
+/// body can never inject a second IRC line or smuggle CTCP framing (\x01).
+fn isIrcFormatControl(byte: u8) bool {
+    return switch (byte) {
+        0x02, // bold
+        0x03, // colour (mIRC \x03NN[,NN])
+        0x04, // hex colour (modern clients)
+        0x0f, // reset / ordin
+        0x11, // monospace
+        0x16, // reverse
+        0x1d, // italic
+        0x1e, // strikethrough
+        0x1f, // underline
+        => true,
+        else => false,
+    };
+}
+
+fn hasDisallowedTextControl(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (byte >= 0x20 and byte != 0x7f) continue;
+        if (isIrcFormatControl(byte)) continue;
+        return true; // CR/LF/NUL/SOH/TAB/…/DEL
+    }
+    return false;
+}
+
 fn validUtf8Field(bytes: []const u8, max_len: usize, allow_empty: bool) bool {
     if ((!allow_empty and bytes.len == 0) or bytes.len > max_len) return false;
     return !hasControl(bytes) and utf8.validateUtf8(bytes);
+}
+
+/// Message body field: UTF-8, length-bounded, IRC formatting allowed, line
+/// breakers and non-format C0 still rejected.
+fn validTextField(bytes: []const u8, max_len: usize, allow_empty: bool) bool {
+    if ((!allow_empty and bytes.len == 0) or bytes.len > max_len) return false;
+    return !hasDisallowedTextControl(bytes) and utf8.validateUtf8(bytes);
 }
 
 fn validNick(nick: []const u8) bool {
@@ -264,7 +300,9 @@ pub fn validateSemantic(msg: RelayMessage) SemanticError!void {
     if (!validPrefix(msg.source_prefix, msg.source_nick)) return invalid();
     if (!validAccount(msg.account)) return invalid();
     if (!validTags(msg.tags)) return invalid();
-    if (!validUtf8Field(msg.text, max_text_len, true)) return invalid();
+    // Body text is the only rendered field that may carry mIRC formatting.
+    // Identity fields (nick/prefix/account/tags/target) stay control-free.
+    if (!validTextField(msg.text, max_text_len, true)) return invalid();
 
     const target_is_channel = validChannel(msg.target);
     const target_is_nick = validNick(msg.target);
@@ -733,6 +771,8 @@ test "semantic validation rejects CR LF NUL and controls in every rendered field
         data_tag,
         recipient,
     };
+    // For text: c0 is CTCP SOH (\x01) — still forbidden. mIRC format codes are
+    // content and are covered by a separate allow-test below.
     const BadByte = enum { cr, lf, crlf, nul, c0, del };
 
     inline for (std.meta.tags(Field)) |field| {
@@ -813,6 +853,50 @@ test "semantic validation rejects CR LF NUL and controls in every rendered field
             }
             try expectSemanticInvalidOnWire(msg);
         }
+    }
+}
+
+test "semantic validation allows mIRC formatting controls in message text only" {
+    // Body text: every standard IRC format code is content, not framing.
+    const format_samples = [_][]const u8{
+        "\x02bold\x02",
+        "\x0304red\x03 plain",
+        "\x0312,01blue on black\x03",
+        "\x04FF0000hex\x04",
+        "\x1funderline\x1f",
+        "\x1ditalic\x1d",
+        "\x1estrike\x1e",
+        "\x16reverse\x16",
+        "\x11mono\x11",
+        "\x02\x0309feat\x0f done",
+        "mixed \x02bold\x0f and plain",
+    };
+    for (format_samples) |text| {
+        var msg = semanticSample();
+        msg.text = text;
+        try validateSemantic(msg);
+        const allocator = std.testing.allocator;
+        const wire = try encode(allocator, msg);
+        defer allocator.free(wire);
+        var owned = try decode(allocator, wire);
+        defer owned.deinit(allocator);
+        try std.testing.expectEqualStrings(text, owned.msg.text);
+    }
+
+    // Same bytes in identity fields remain illegal (no format smuggling into nick).
+    var bad_nick = semanticSample();
+    bad_nick.source_nick = "al\x03ice";
+    try expectSemanticInvalidOnWire(bad_nick);
+
+    var bad_prefix = semanticSample();
+    bad_prefix.source_prefix = "alice!us\x02er@example.invalid";
+    try expectSemanticInvalidOnWire(bad_prefix);
+
+    // Non-format C0 still rejected in text (TAB, BEL, SOH/CTCP, ESC).
+    for ([_][]const u8{ "a\tb", "a\x07b", "a\x01b", "a\x1bb" }) |text| {
+        var msg = semanticSample();
+        msg.text = text;
+        try expectSemanticInvalidOnWire(msg);
     }
 }
 
