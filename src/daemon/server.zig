@@ -8127,6 +8127,10 @@ pub const LinuxServer = struct {
         link.feed(bytes, now) catch |err| {
             var err_buf: [128]u8 = undefined;
             const detail = std.fmt.bufPrint(&err_buf, "secured link handshake/feed failed: {s}", .{@errorName(err)}) catch "secured link handshake/feed failed";
+            // Journal-visible: auto-connect only logs "dial initiated", so a
+            // silent PrekeyRejected/MeshPassMismatch/BadSignature loop is
+            // invisible without this (2026-07-19 realm-rename domain netsplit).
+            srvLog("onyx-server: mesh {s}\n", .{detail});
             self.traceLog(.warn, .s2s, detail);
             self.logMeshEvent(.link_handshake, if (link.remoteName().len != 0) link.remoteName() else "pending-secured-peer", detail);
             conn.closing = true;
@@ -10763,8 +10767,8 @@ pub const LinuxServer = struct {
             const stable_msgid = msgid_mod.fromStableId(predicted_relay_id, &msgid_buf);
             // ADS1 spool pressure must not abort RVG2/Lotus/RVL2 admission.
             // When the attachment batch cannot be reserved, continue without it
-            // so mesh durability and ordinary local delivery still succeed
-            // (local-first: #root chat must not brick on a full spool).
+            // so mesh durability still publishes and local delivery uses
+            // mesh_busy_local SendQ (not a skip of durable admit).
             prepared_delivery = self.prepareAttachmentDeliveryBatch(
                 plan.recipients,
                 .{
@@ -68290,10 +68294,12 @@ test "exploit: channel PRIVMSG ADS1 soft-fail after durable admit still delivers
     member.send_len = 0;
     var line = try irc_line.parseLine("PRIVMSG #admit-cap :still-delivers-under-spool-pressure");
     try server.handleMessage(sender_id, sender, &line, "PRIVMSG");
-    // Local-first: no FAIL, member still sees the line (SendQ, not ADS1).
+    // ADS1 soft-fail: no FAIL, member still sees the line (SendQ, not ADS1).
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "FAIL PRIVMSG") == null);
     try expectContains(member.send_buf[0..member.send_len], "still-delivers-under-spool-pressure");
+    // Durable authorities still published without the attachment batch.
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
 
     // Restore capacity (swap the limited spool out; defer restores original).
     {
@@ -68311,6 +68317,306 @@ test "exploit: channel PRIVMSG ADS1 soft-fail after durable admit still delivers
         // Put limited back so outer defer's swap/deinit stays valid.
         std.mem.swap(attachment_delivery_spool.Spool, &server.attachment_delivery_spool, &roomy);
     }
+}
+
+test "exploit: channel PRIVMSG durable admit capacity fails closed with TEMPORARILY_UNAVAILABLE" {
+    // Unlike ADS1 soft-fail, a full RVL2 event log aborts durable admit. The
+    // fail-closed contract: no local delivery, PRIVMSG gets TEMPORARILY_UNAVAILABLE.
+    // NOTICE stays silent and also does not deliver.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc1)), "privmsg-admit-fail");
+    defer identity.deinit();
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc2)), "privmsg-admit-fail");
+    defer peer_identity.deinit();
+    const local_root = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.authoredRelayV2Configured());
+
+    const sender_id = try addTestLocalClient(&server, "FailSender", "fail-sender");
+    const member_id = try addTestLocalClient(&server, "FailMember", "fail-member");
+    const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
+    const member = server.connFor(member_id) orelse return error.TestUnexpectedResult;
+    sender.overflow_allocator = allocator;
+    member.overflow_allocator = allocator;
+    sender.session.registration.registered = true;
+    member.session.registration.registered = true;
+    sender.session.addCap(.standard_replies);
+    member.session.addCap(.message_tags);
+    _ = try server.world.join("#admit-fail", worldIdFromClient(sender_id));
+    _ = try server.world.join("#admit-fail", worldIdFromClient(member_id));
+
+    // Saturate RVO2 so the durable admit fails only after RVG2/RVL2/Lotus/ADS1
+    // have staged. Capacity rejection must abort every staged authority.
+    var direct_peer: u64 = 0;
+    for (server.relay_v2_required_nodes) |node| {
+        if (node == server.config.node_id) continue;
+        direct_peer = node;
+        break;
+    }
+    try std.testing.expect(direct_peer != 0);
+    server.relay_v2_outbox.max_entries = 1;
+    try server.relay_v2_outbox.putBatchExcluding(
+        &.{direct_peer},
+        null,
+        @as(message_relay_v2.RelayId, @splat(0x77)),
+        "seed-wire",
+        server.meshWallMs(),
+        relay_v2_outbox.local_origin_exclusion,
+    );
+
+    sender.send_len = 0;
+    member.send_len = 0;
+    var line = try irc_line.parseLine("PRIVMSG #admit-fail :must-not-fallthrough");
+    try server.handleMessage(sender_id, sender, &line, "PRIVMSG");
+    try expectContains(sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE");
+    try expectContains(sender.send_buf[0..sender.send_len], "FAIL PRIVMSG");
+    try std.testing.expect(std.mem.indexOf(u8, member.send_buf[0..member.send_len], "must-not-fallthrough") == null);
+
+    // NOTICE: same admit gate, silent (no error reply) and no delivery.
+    sender.send_len = 0;
+    member.send_len = 0;
+    var notice_line = try irc_line.parseLine("NOTICE #admit-fail :notice-must-not-deliver");
+    try server.handleMessage(sender_id, sender, &notice_line, "NOTICE");
+    try std.testing.expectEqual(@as(usize, 0), sender.send_len);
+    try std.testing.expect(std.mem.indexOf(u8, member.send_buf[0..member.send_len], "notice-must-not-deliver") == null);
+}
+
+test "exploit: direct PRIVMSG NOTICE RVO2-full admission fails closed without authority drift" {
+    // Direct path matches channel: true durable-admission failure emits
+    // TEMPORARILY_UNAVAILABLE for PRIVMSG and stays silent for NOTICE. It never
+    // falls through to local or cross-shard recipient/sender-session delivery.
+    if (comptime builtin.os.tag != .linux) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    defer current_reactor = null;
+
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc3)), "dm-admit-fail");
+    defer identity.deinit();
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0xc4)), "dm-admit-fail");
+    defer peer_identity.deinit();
+    const local_root = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
+    const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
+    const roots = [_][]const u8{&peer_root};
+    const roster = [_][]const u8{ &local_root, &peer_root };
+
+    var server = Server.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .num_shards = 2,
+        .node_id = identity.shortId(),
+        .node_identity = &identity,
+        .crypto_io = std.testing.io,
+        .require_secured = true,
+        .mesh_trust_roots = &roots,
+        .relay_v2_authoring = .active,
+        .relay_v2_activation_epoch = 1,
+        .relay_v2_roster = &roster,
+    }) catch |err| switch (err) {
+        error.Unsupported, error.PermissionDenied, error.SocketUnavailable, error.AddressInUse => return error.SkipZigTest,
+        else => return err,
+    };
+    defer server.deinit();
+    if (server.reactors.len < 2) return error.SkipZigTest;
+    server.fabric = reactor_fabric.ReactorFabric.init(server.allocator, server.reactors.len) catch |err| switch (err) {
+        error.ReactorWakeUnsupported => return error.SkipZigTest,
+        else => return err,
+    };
+    current_reactor = &server.reactors[0];
+    try std.testing.expect(server.authoredRelayV2Configured());
+
+    // Create one exact-token sender sibling and recipient sibling on shard 1.
+    // A fallthrough bug would therefore enqueue real cross-reactor delivery.
+    const sender_id = try addTestLocalClient(&server, "DmFailSender", "dm-fail-sender");
+    const target_id = try addTestLocalClient(&server, "DmFailTarget", "dm-fail-target");
+    const sender = server.connFor(sender_id) orelse return error.TestUnexpectedResult;
+    const target = server.connFor(target_id) orelse return error.TestUnexpectedResult;
+    current_reactor = &server.reactors[1];
+    const sender_sibling_id = try addTestLocalClient(&server, "DmFailSenderAttach", "dm-fail-sender");
+    const target_sibling_id = try addTestLocalClient(&server, "DmFailTargetAttach", "dm-fail-target");
+    const sender_sibling = server.connFor(sender_sibling_id) orelse return error.TestUnexpectedResult;
+    const target_sibling = server.connFor(target_sibling_id) orelse return error.TestUnexpectedResult;
+    server.world.unregisterNick(worldIdFromClient(sender_sibling_id));
+    server.world.unregisterNick(worldIdFromClient(target_sibling_id));
+    try sender_sibling.session.setNick("DmFailSender");
+    try target_sibling.session.setNick("DmFailTarget");
+    const sender_token = (server.sessions.resumeHandleForClient(
+        "dm-fail-sender",
+        monitorIdFromClient(sender_id),
+    ) orelse return error.TestUnexpectedResult).token;
+    const target_token = (server.sessions.resumeHandleForClient(
+        "dm-fail-target",
+        monitorIdFromClient(target_id),
+    ) orelse return error.TestUnexpectedResult).token;
+    try std.testing.expect(server.sessions.joinTokenGroup(
+        "dm-fail-sender",
+        monitorIdFromClient(sender_sibling_id),
+        sender_token,
+    ));
+    try std.testing.expect(server.sessions.joinTokenGroup(
+        "dm-fail-target",
+        monitorIdFromClient(target_sibling_id),
+        target_token,
+    ));
+    current_reactor = &server.reactors[0];
+
+    inline for (.{ sender, target, sender_sibling, target_sibling }) |conn| {
+        conn.overflow_allocator = allocator;
+        conn.session.registration.registered = true;
+        conn.session.addCap(.message_tags);
+    }
+    sender.session.addCap(.standard_replies);
+    try std.testing.expect(server.attachmentHasReusableSession(target_id));
+    try std.testing.expect(server.attachmentHasReusableSession(target_sibling_id));
+
+    // RVO2 is the final fallible member of the admission cut. Fill it so
+    // RVG2/RVL2/Lotus and the complete ADS1 batch stage first, then all abort.
+    var direct_peer: u64 = 0;
+    for (server.relay_v2_required_nodes) |node| {
+        if (node == server.config.node_id) continue;
+        direct_peer = node;
+        break;
+    }
+    try std.testing.expect(direct_peer != 0);
+    server.relay_v2_outbox.max_entries = 1;
+    try server.relay_v2_outbox.putBatchExcluding(
+        &.{direct_peer},
+        null,
+        @as(message_relay_v2.RelayId, @splat(0x78)),
+        "seed-wire-dm",
+        server.meshWallMs(),
+        relay_v2_outbox.local_origin_exclusion,
+    );
+
+    const AuthoritySnapshot = struct {
+        allocator: std.mem.Allocator,
+        rvg2: []u8,
+        rvl2: []u8,
+        rvo2: []u8,
+        ads1: []u8,
+        lotus_bytes: []u8,
+        rvl2_len: usize,
+        rvo2_len: usize,
+        ads1_len: usize,
+
+        fn capture(srv: *Server, alloc: std.mem.Allocator) !@This() {
+            const rvg2 = try srv.relay_v2_replay_guard.encodeCheckpoint(alloc);
+            errdefer alloc.free(rvg2);
+            const rvl2 = try srv.relay_v2_event_log.encodeCheckpoint(alloc);
+            errdefer alloc.free(rvl2);
+            const rvo2 = try srv.relay_v2_outbox.encodeCheckpoint(alloc);
+            errdefer alloc.free(rvo2);
+            const ads1 = try srv.attachment_delivery_spool.encodeCheckpoint(alloc);
+            errdefer alloc.free(ads1);
+            const lotus_bytes = try srv.history.encodeCheckpoint(alloc);
+            errdefer alloc.free(lotus_bytes);
+            return .{
+                .allocator = alloc,
+                .rvg2 = rvg2,
+                .rvl2 = rvl2,
+                .rvo2 = rvo2,
+                .ads1 = ads1,
+                .lotus_bytes = lotus_bytes,
+                .rvl2_len = srv.relay_v2_event_log.len(),
+                .rvo2_len = srv.relay_v2_outbox.len(),
+                .ads1_len = srv.attachment_delivery_spool.len(),
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.allocator.free(self.rvg2);
+            self.allocator.free(self.rvl2);
+            self.allocator.free(self.rvo2);
+            self.allocator.free(self.ads1);
+            self.allocator.free(self.lotus_bytes);
+            self.* = undefined;
+        }
+
+        fn expectEqual(self: *const @This(), other: *const @This()) !void {
+            try std.testing.expectEqualSlices(u8, self.rvg2, other.rvg2);
+            try std.testing.expectEqualSlices(u8, self.rvl2, other.rvl2);
+            try std.testing.expectEqualSlices(u8, self.rvo2, other.rvo2);
+            try std.testing.expectEqualSlices(u8, self.ads1, other.ads1);
+            try std.testing.expectEqualSlices(u8, self.lotus_bytes, other.lotus_bytes);
+            try std.testing.expectEqual(self.rvl2_len, other.rvl2_len);
+            try std.testing.expectEqual(self.rvo2_len, other.rvo2_len);
+            try std.testing.expectEqual(self.ads1_len, other.ads1_len);
+        }
+    };
+    var before = try AuthoritySnapshot.capture(&server, allocator);
+    defer before.deinit();
+
+    sender.send_len = 0;
+    target.send_len = 0;
+    sender_sibling.send_len = 0;
+    target_sibling.send_len = 0;
+    var line = try irc_line.parseLine("PRIVMSG DmFailTarget :dm-must-not-fall-through");
+    try server.handleMessage(sender_id, sender, &line, "PRIVMSG");
+    try expectContains(sender.send_buf[0..sender.send_len], "FAIL PRIVMSG TEMPORARILY_UNAVAILABLE");
+    try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "dm-must-not-fall-through") == null);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(usize, 0), sender_sibling.send_len);
+    try std.testing.expectEqual(@as(usize, 0), target_sibling.send_len);
+    var pending: [4]reactor_fabric.DeliverMsg = undefined;
+    try std.testing.expectEqual(@as(usize, 0), server.fabric.?.drain(1, &pending));
+    var after_privmsg = try AuthoritySnapshot.capture(&server, allocator);
+    defer after_privmsg.deinit();
+    try before.expectEqual(&after_privmsg);
+
+    // NOTICE traverses the same token-addressed admit lane but never auto-replies.
+    sender.send_len = 0;
+    sender.send_offset = 0;
+    target.send_len = 0;
+    target.send_offset = 0;
+    sender_sibling.send_len = 0;
+    sender_sibling.send_offset = 0;
+    target_sibling.send_len = 0;
+    target_sibling.send_offset = 0;
+    var notice = try irc_line.parseLine("NOTICE DmFailTarget :notice-must-not-fall-through");
+    try server.handleMessage(sender_id, sender, &notice, "NOTICE");
+    try std.testing.expectEqual(@as(usize, 0), sender.send_len);
+    try std.testing.expectEqual(@as(usize, 0), target.send_len);
+    try std.testing.expectEqual(@as(usize, 0), sender_sibling.send_len);
+    try std.testing.expectEqual(@as(usize, 0), target_sibling.send_len);
+    try std.testing.expectEqual(@as(usize, 0), server.fabric.?.drain(1, &pending));
+    var after_notice = try AuthoritySnapshot.capture(&server, allocator);
+    defer after_notice.deinit();
+    try before.expectEqual(&after_notice);
+
+    var dm_key_buf: [320]u8 = undefined;
+    const dm_key = LinuxServer.dmHistoryKey(
+        sender.session.displayName(),
+        sender.session.account(),
+        target.session.displayName(),
+        target.session.account(),
+        &dm_key_buf,
+    ) orelse return error.TestUnexpectedResult;
+    var history_rows: [2]lotus.Message = undefined;
+    try std.testing.expectEqual(@as(usize, 0), (try server.history.latest(dm_key, history_rows.len, &history_rows)).len);
+    try std.testing.expectEqual(@as(usize, 0), server.relay_v2_event_log.len());
+    try std.testing.expectEqual(@as(usize, 1), server.relay_v2_outbox.len());
+    try std.testing.expectEqual(@as(usize, 0), server.attachment_delivery_spool.len());
 }
 
 test "exploit: oversized color-formatted PRIVMSG does not brick channel chat" {
@@ -70075,7 +70381,7 @@ test "authored MESSAGE_V2 ADS1 capacity soft-fail preserves spool while mesh aut
     // ADS1 spool pressure soft-fails the attachment batch only. Durable
     // membership is configured, so RVG2/RVL2/RVO2 must still publish; the spool
     // itself stays byte-identical so a full ADS1 never corrupts retained rows.
-    var admitted = try server.admitAuthoredRelayV2(
+    const admitted = try server.admitAuthoredRelayV2(
         .privmsg,
         "#durable",
         0,
@@ -70118,9 +70424,9 @@ test "threaded server: PRIVMSG NOTICE ADS1 soft-fail after durable admission sti
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
-    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "local-first-admit");
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x71)), "ads1-soft-fail");
     defer identity.deinit();
-    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x72)), "local-first-admit");
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x72)), "ads1-soft-fail");
     defer peer_identity.deinit();
     const local_root = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
     const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
@@ -70155,8 +70461,8 @@ test "threaded server: PRIVMSG NOTICE ADS1 soft-fail after durable admission sti
     member.session.addCap(.message_tags);
     member.send_armed = true;
     sender.send_armed = true;
-    _ = try server.world.join("#local-first", worldIdFromClient(sender_id));
-    _ = try server.world.join("#local-first", worldIdFromClient(member_id));
+    _ = try server.world.join("#ads1-soft", worldIdFromClient(sender_id));
+    _ = try server.world.join("#ads1-soft", worldIdFromClient(member_id));
 
     // Saturate ADS1 so attachment-batch preparation returns CapacityExceeded.
     // The durable mesh authorities still have capacity and must accept.
@@ -70181,8 +70487,8 @@ test "threaded server: PRIVMSG NOTICE ADS1 soft-fail after durable admission sti
     member.send_offset = 0;
     sender.send_len = 0;
     sender.send_offset = 0;
-    try server.messageOne(sender_id, sender, "PRIVMSG", "#local-first", "local-first-privmsg", null);
-    try expectContains(member.send_buf[0..member.send_len], "PRIVMSG #local-first :local-first-privmsg");
+    try server.messageOne(sender_id, sender, "PRIVMSG", "#ads1-soft", "ads1-soft-privmsg", null);
+    try expectContains(member.send_buf[0..member.send_len], "PRIVMSG #ads1-soft :ads1-soft-privmsg");
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "FAIL PRIVMSG") == null);
     try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
@@ -70191,17 +70497,17 @@ test "threaded server: PRIVMSG NOTICE ADS1 soft-fail after durable admission sti
 
     // Lotus published inside the same durable-admission cut.
     var hbuf: [4]lotus.Message = undefined;
-    const recorded = server.history.latest("#local-first", hbuf.len, &hbuf) catch &.{};
+    const recorded = server.history.latest("#ads1-soft", hbuf.len, &hbuf) catch &.{};
     try std.testing.expect(recorded.len >= 1);
-    try std.testing.expectEqualStrings("local-first-privmsg", recorded[0].text);
+    try std.testing.expectEqualStrings("ads1-soft-privmsg", recorded[0].text);
 
     // NOTICE: same post-admit ADS1 soft-fail delivery, and never an error reply.
     member.send_len = 0;
     member.send_offset = 0;
     sender.send_len = 0;
     sender.send_offset = 0;
-    try server.messageOne(sender_id, sender, "NOTICE", "#local-first", "local-first-notice", null);
-    try expectContains(member.send_buf[0..member.send_len], "NOTICE #local-first :local-first-notice");
+    try server.messageOne(sender_id, sender, "NOTICE", "#ads1-soft", "ads1-soft-notice", null);
+    try expectContains(member.send_buf[0..member.send_len], "NOTICE #ads1-soft :ads1-soft-notice");
     try std.testing.expectEqual(@as(usize, 0), sender.send_len); // NOTICE never errors
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
     try std.testing.expectEqual(@as(usize, 2), server.relay_v2_event_log.len());
@@ -70218,9 +70524,9 @@ test "threaded server: cross-shard PRIVMSG ADS1 soft-fail after durable admissio
     const allocator = std.testing.allocator;
     defer current_reactor = null;
 
-    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x73)), "cross-shard-local-first");
+    var identity = try node_identity.fromSeed(@as([32]u8, @splat(0x73)), "cross-shard-ads1-soft");
     defer identity.deinit();
-    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x74)), "cross-shard-local-first");
+    var peer_identity = try node_identity.fromSeed(@as([32]u8, @splat(0x74)), "cross-shard-ads1-soft");
     defer peer_identity.deinit();
     const local_root = std.fmt.bytesToHex(identity.sign_kp.public_key, .lower);
     const peer_root = std.fmt.bytesToHex(peer_identity.sign_kp.public_key, .lower);
@@ -70271,8 +70577,8 @@ test "threaded server: cross-shard PRIVMSG ADS1 soft-fail after durable admissio
     // World membership is shared; join both under the world write lock geometry
     // of a single-threaded test (no concurrent reactor owns the lock).
     current_reactor = &server.reactors[0];
-    _ = try server.world.join("#xshard-lf", worldIdFromClient(sender_id));
-    _ = try server.world.join("#xshard-lf", worldIdFromClient(member_id));
+    _ = try server.world.join("#xshard-ads1", worldIdFromClient(sender_id));
+    _ = try server.world.join("#xshard-ads1", worldIdFromClient(member_id));
 
     // Saturate ADS1 so durable attachment reservation soft-fails.
     var limited_spool = try attachment_delivery_spool.Spool.init(allocator, .{
@@ -70297,7 +70603,7 @@ test "threaded server: cross-shard PRIVMSG ADS1 soft-fail after durable admissio
     sender.send_len = 0;
     sender.send_offset = 0;
     current_reactor = &server.reactors[0];
-    try server.messageOne(sender_id, sender, "PRIVMSG", "#xshard-lf", "cross-shard-local-first", null);
+    try server.messageOne(sender_id, sender, "PRIVMSG", "#xshard-ads1", "cross-shard-ads1-soft", null);
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "TEMPORARILY_UNAVAILABLE") == null);
     try std.testing.expect(std.mem.indexOf(u8, sender.send_buf[0..sender.send_len], "FAIL PRIVMSG") == null);
     try std.testing.expectEqual(@as(usize, 1), server.relay_v2_event_log.len());
@@ -70308,7 +70614,7 @@ test "threaded server: cross-shard PRIVMSG ADS1 soft-fail after durable admissio
     // the foreign ConnState's inline send_buf (address-stable, single-writer).
     current_reactor = &server.reactors[1];
     server.drainFabric();
-    try expectContains(member.send_buf[0..member.send_len], "PRIVMSG #xshard-lf :cross-shard-local-first");
+    try expectContains(member.send_buf[0..member.send_len], "PRIVMSG #xshard-ads1 :cross-shard-ads1-soft");
     // Buffer returned to the target shard pool (release-exactly-once).
     const reclaimed = server.fabric.?.acquire(1, "reclaimed") orelse return error.TestExpectedEqual;
     server.fabric.?.release(1, reclaimed);

@@ -33,7 +33,20 @@ pub const SignError = std.crypto.errors.IdentityElementError ||
 
 pub const VerifyError = StdEd25519.Signature.VerifyError || error{InvalidInfixWidth};
 
-const domain_prefix_magic = "onyx-ed25519ctx-v1";
+/// Wire domain-prefix magic bound into every `signCtx` / `signCtxInfix`
+/// transcript. This is a **protocol constant**, not a product brand string:
+/// changing it silently invalidates Mooring prekeys, M1/M2, and signed S2S
+/// frames against any peer that still produces the previous magic (the
+/// Orochi→Onyx mesh netsplit of 2026-07-19, where `orochi-ed25519ctx-v1` was
+/// renamed to `onyx-ed25519ctx-v1` on one node only). Keep the historical
+/// value so mixed-version and rolling deploys keep a shared wire domain.
+const domain_prefix_magic = "orochi-ed25519ctx-v1";
+
+/// Additional domain-prefix magics accepted on verify only. Covers the short
+/// window where a renamed binary signed with `onyx-ed25519ctx-v1`. Sign paths
+/// always use `domain_prefix_magic`; verify tries the primary first, then each
+/// alternate — never the reverse on the sign side (no dual signatures).
+const alt_domain_prefix_magics = [_][]const u8{"onyx-ed25519ctx-v1"};
 
 /// The `infix` in signCtxInfix/verifyCtxInfix is concatenated with `msg` WITHOUT
 /// a length delimiter, so (infix="AB",msg="C") and (infix="A",msg="BC") would
@@ -175,17 +188,19 @@ pub fn verify(msg: []const u8, sig: Signature, public_key: PublicKey) VerifyErro
 }
 
 /// Verify a domain-separated Ed25519 signature created by `KeyPair.signCtx`.
+/// Accepts the current wire magic and any `alt_domain_prefix_magics` entry so a
+/// peer that briefly signed under a renamed prefix still verifies.
 pub fn verifyCtx(
     comptime domain: []const u8,
     msg: []const u8,
     sig: Signature,
     public_key: PublicKey,
 ) VerifyError!bool {
-    const prefix = domainPrefix(domain);
-    return verifyPrefixed(&prefix, "", msg, sig, public_key);
+    return verifyCtxWithMagics(domain, "", msg, sig, public_key, false);
 }
 
 /// Verify a signature created by `KeyPair.signCtxInfix` over `infix ++ msg`.
+/// Same dual-magic acceptance as `verifyCtx`.
 pub fn verifyCtxInfix(
     comptime domain: []const u8,
     infix: []const u8,
@@ -194,8 +209,25 @@ pub fn verifyCtxInfix(
     public_key: PublicKey,
 ) VerifyError!bool {
     if (infix.len != known_infix_len) return error.InvalidInfixWidth;
-    const prefix = domainPrefix(domain);
-    return verifyPrefixed(&prefix, infix, msg, sig, public_key);
+    return verifyCtxWithMagics(domain, infix, msg, sig, public_key, true);
+}
+
+fn verifyCtxWithMagics(
+    comptime domain: []const u8,
+    infix: []const u8,
+    msg: []const u8,
+    sig: Signature,
+    public_key: PublicKey,
+    enforce_infix: bool,
+) VerifyError!bool {
+    _ = enforce_infix;
+    const primary = domainPrefix(domain);
+    if (try verifyPrefixed(&primary, infix, msg, sig, public_key)) return true;
+    inline for (alt_domain_prefix_magics) |alt_magic| {
+        const alt = domainPrefixWithMagic(alt_magic, domain);
+        if (try verifyPrefixed(&alt, infix, msg, sig, public_key)) return true;
+    }
+    return false;
 }
 
 fn verifyPrefixed(
@@ -220,15 +252,23 @@ fn verifyPrefixed(
 }
 
 fn domainPrefix(comptime domain: []const u8) [domain_prefix_magic.len + 1 + domain.len]u8 {
+    return domainPrefixWithMagic(domain_prefix_magic, domain);
+}
+
+fn domainPrefixWithMagic(
+    comptime magic: []const u8,
+    comptime domain: []const u8,
+) [magic.len + 1 + domain.len]u8 {
     comptime {
         if (domain.len == 0) @compileError("Ed25519 domain label must not be empty");
         if (domain.len > std.math.maxInt(u8)) @compileError("Ed25519 domain label exceeds 255 bytes");
+        if (magic.len == 0) @compileError("Ed25519 domain-prefix magic must not be empty");
     }
 
-    var out: [domain_prefix_magic.len + 1 + domain.len]u8 = undefined;
-    @memcpy(out[0..domain_prefix_magic.len], domain_prefix_magic);
-    out[domain_prefix_magic.len] = @intCast(domain.len);
-    @memcpy(out[domain_prefix_magic.len + 1 ..], domain);
+    var out: [magic.len + 1 + domain.len]u8 = undefined;
+    @memcpy(out[0..magic.len], magic);
+    out[magic.len] = @intCast(domain.len);
+    @memcpy(out[magic.len + 1 ..], domain);
     return out;
 }
 
@@ -329,6 +369,42 @@ test "LOW-2: signCtxInfix/verifyCtxInfix reject a non-fixed-width infix" {
     try std.testing.expectError(error.InvalidInfixWidth, kp.signCtxInfix("onyx-low2-guard-test-v1", "", "msg"));
     try std.testing.expectError(error.InvalidInfixWidth, kp.signCtxInfix("onyx-low2-guard-test-v1", "AB", "msg"));
     try std.testing.expectError(error.InvalidInfixWidth, verifyCtxInfix("onyx-low2-guard-test-v1", "AB", "msg", sig, kp.public_key));
+}
+
+test "legacy Onyx rename domain-prefix magic still verifies (mesh rollout)" {
+    // Regression for the 2026-07-19 netsplit: a peer signed under the short-lived
+    // `onyx-ed25519ctx-v1` magic must still verify on a node that signs with the
+    // wire-stable `orochi-ed25519ctx-v1` magic. Sign path stays on the primary
+    // magic; only verify is dual-accept.
+    var kp = try KeyPair.fromSeed(hex("4ccd089b28ff96da9db6c346ec114e0f" ++
+        "5b8a319f35aba624da8cf6ed4fb8a6fb"));
+    defer kp.deinit();
+
+    const domain = "tsumugi-prekey-v1";
+    const msg = "prekey transcript bytes";
+
+    // Primary (wire-stable) sign/verify still round-trips.
+    const primary_sig = try kp.signCtx(domain, msg);
+    try std.testing.expect(try verifyCtx(domain, msg, primary_sig, kp.public_key));
+
+    // A signature produced under the renamed magic (what a mid-rename peer
+    // would emit) must also verify — dual-magic acceptance on the verify path.
+    const alt_prefix = domainPrefixWithMagic("onyx-ed25519ctx-v1", domain);
+    const alt_sig = try kp.signPrefixed(&alt_prefix, "", msg);
+    try std.testing.expect(try verifyCtx(domain, msg, alt_sig, kp.public_key));
+
+    // Same for the infix path used by signed S2S frames.
+    const infix = &[_]u8{0x2a};
+    const primary_infix = try kp.signCtxInfix("signed-frame-v1", infix, msg);
+    try std.testing.expect(try verifyCtxInfix("signed-frame-v1", infix, msg, primary_infix, kp.public_key));
+    const alt_infix_prefix = domainPrefixWithMagic("onyx-ed25519ctx-v1", "signed-frame-v1");
+    const alt_infix_sig = try kp.signPrefixed(&alt_infix_prefix, infix, msg);
+    try std.testing.expect(try verifyCtxInfix("signed-frame-v1", infix, msg, alt_infix_sig, kp.public_key));
+
+    // Tamper still fails under both magics.
+    var bad = alt_sig;
+    bad[0] ^= 0x01;
+    try std.testing.expect(!try verifyCtx(domain, msg, bad, kp.public_key));
 }
 
 test {
