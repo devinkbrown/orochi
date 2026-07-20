@@ -45,6 +45,7 @@ fn expectHandshakeError(err: websocket.HandshakeError) void {
         error.InvalidUpgrade,
         error.InvalidConnection,
         error.InvalidKey,
+        error.InvalidSubprotocol,
         error.UnsupportedVersion,
         error.OutputTooSmall,
         => {},

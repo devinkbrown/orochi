@@ -172,14 +172,14 @@ pub const registry = [_]Descriptor{
     // upgrade. `min_supported = 1` keeps accepting capsules sealed by pre-bump
     // binaries; `s2s_snapshot.decode` is version-aware.
     .{ .kind = .s2s_link, .schema_id = 0x4832_534c, .current_version = 4, .min_supported = 1, .max_supported = 4 },
-    // v2 (2026-07): appends the WS adapter's partial framing state — the
-    // deframer's buffered partial inbound frame + fragmentation flags and the tx
-    // accumulator's partial outbound line — so a mid-frame wss client is carried
-    // instead of dropped (v1 only sealed at a clean framing boundary, which an
-    // active browser client almost never sits at, so every busy wss client
-    // reconnected on every upgrade). `min_supported = 1` keeps accepting v1
-    // capsules sealed by pre-bump binaries; `ws_snapshot.decode` is version-aware.
-    .{ .kind = .ws_session, .schema_id = 0x4857_5353, .current_version = 2, .min_supported = 1, .max_supported = 2 },
+    // v2 (2026-07) appended the WS adapter's partial framing state so a
+    // mid-frame wss client is carried instead of dropped. v3 appends the
+    // selected WebSocket application protocol, which controls
+    // whether binary Cadence datagrams are admissible. Current Helix adoption is
+    // exact-only so this security boundary can never silently downgrade to the
+    // legacy no-subprotocol behavior. v1/v2 remain available only through the
+    // explicit version-aware cold decoder in `ws_snapshot`.
+    .{ .kind = .ws_session, .schema_id = 0x4857_5353, .current_version = 3, .min_supported = 3, .max_supported = 3 },
     .{ .kind = .tls_ticket_keys, .schema_id = 0x4854_4b59, .current_version = 1, .min_supported = 1, .max_supported = 1 },
     // v1 carried one staged migration per capsule and necessarily lost ordering,
     // lease, and consumed-token metadata. v2 carries one integrity-checked PMST
@@ -300,7 +300,7 @@ pub fn validate(capsule: Capsule) Error!void {
     //   (a) every per-family adoption selector / handoff_relations helper, which
     //       pins the version exactly (`.clients`/`.channels`/checkpoints) or
     //       requires `negotiate(...) == header.version` (the rolling `.s2s_link`/
-    //       `.tls_session`/`.ws_session`/`.sessions` families) — a too-new header
+    //       `.tls_session`/`.sessions` families) — a too-new header
     //       fails that equality and is rejected before any DATA decoder runs; and
     //   (b) every per-kind DATA decoder's explicit `else => UnsupportedVersion`.
     // So a too-new capsule NEVER reaches a progressive `if (version >= N)` arm.

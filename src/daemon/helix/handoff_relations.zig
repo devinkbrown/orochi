@@ -194,18 +194,18 @@ pub fn validateCurrent(capsules: []const capsule.Capsule, state_fds: []const i32
             summary.tls += 1;
         },
         .ws_session => {
-            const bytes = canonicalRollingPayload(item, .ws_session) orelse return error.InvalidWebSocket;
-            const websocket = ws_snapshot.decode(bytes, item.header.version) catch return error.InvalidWebSocket;
-            // `decode` (unlike `decodeCurrent`) does not enforce it, but only an
-            // OPEN adapter is ever sealed for adoption — a closed one is invalid.
-            if (!websocket.phase_open) return error.InvalidWebSocket;
+            // The selected application protocol is an enforcement boundary.
+            // Current Helix adoption therefore requires the exact v3 shape;
+            // legacy v1/v2 decoding exists only for explicit cold migration.
+            const bytes = canonicalPayload(item, .ws_session) orelse return error.InvalidWebSocket;
+            const websocket = ws_snapshot.decodeCurrent(bytes) catch return error.InvalidWebSocket;
             const client = findClient(capsules, websocket.fd) orelse return error.OrphanWebSocket;
             if (!client.was_websocket) return error.UnexpectedWebSocket;
             for (capsules[0..index]) |prior| {
                 if (prior.header.kind != .ws_session) continue;
                 // Dead in practice (prior already decoded as `item`) — but never
                 // assert `unreachable` on inherited bytes; fail closed instead.
-                const prior_ws = ws_snapshot.decode(prior.fields[0].bytes, prior.header.version) catch return error.InvalidWebSocket;
+                const prior_ws = ws_snapshot.decodeCurrent(prior.fields[0].bytes) catch return error.InvalidWebSocket;
                 if (prior_ws.fd == websocket.fd) return error.DuplicateWebSocket;
             }
             summary.websockets += 1;
@@ -376,11 +376,12 @@ fn canonicalS2sPayload(item: capsule.Capsule) ?[]const u8 {
 }
 
 /// The rolling-compatible sidecar analogue of `canonicalS2sPayload` for the
-/// TLS/WS transport capsules: their descriptors advertise a `min_supported`
+/// TLS transport capsule: its descriptor advertises a `min_supported`
 /// window (so a pre-bump predecessor's capsule still adopts instead of
 /// netsplitting the next USR2). Require the predecessor's advertised current
 /// version to be the negotiated overlap, then let the per-version decoder
-/// validate the exact body. Owning/exact families keep `canonicalPayload`.
+/// validate the exact body. WebSocket and owning/exact families keep
+/// `canonicalPayload`.
 fn canonicalRollingPayload(item: capsule.Capsule, kind: capsule.CapsuleKind) ?[]const u8 {
     if (item.header.kind != kind or item.fields.len != 1 or
         item.fields[0].ordinal != 1) return null;
@@ -417,7 +418,7 @@ fn countWebSocketsForFd(capsules: []const capsule.Capsule, fd: i32) usize {
     var count: usize = 0;
     for (capsules) |item| {
         if (item.header.kind != .ws_session) continue;
-        const websocket = ws_snapshot.decode(item.fields[0].bytes, item.header.version) catch continue;
+        const websocket = ws_snapshot.decodeCurrent(item.fields[0].bytes) catch continue;
         if (websocket.fd == fd) count += 1;
     }
     return count;
@@ -776,6 +777,135 @@ test "current handoff relations reject missing duplicate orphan and unexpected t
     var closed_ws_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = closed_ws }};
     var malformed_caps = base_caps;
     malformed_caps[3] = capsule.make(.ws_session, &closed_ws_field);
+    try std.testing.expectError(
+        error.InvalidWebSocket,
+        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+    );
+
+    const retained_internal_cr_ws = try ws_snapshot.encode(allocator, .{
+        .fd = 10,
+        .tx = "NOTICE Bob :one\rPRIVMSG Bob :two",
+    });
+    defer allocator.free(retained_internal_cr_ws);
+    var retained_internal_cr_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = retained_internal_cr_ws }};
+    malformed_caps[3] = capsule.make(.ws_session, &retained_internal_cr_field);
+    try std.testing.expectError(
+        error.InvalidWebSocket,
+        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+    );
+
+    const missing_binary_accumulator_ws = try ws_snapshot.encode(allocator, .{
+        .fd = 10,
+        .fragmented = true,
+        .msg_binary = true,
+        .subprotocol = .onyx_irc_media,
+    });
+    defer allocator.free(missing_binary_accumulator_ws);
+    var missing_binary_accumulator_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = missing_binary_accumulator_ws }};
+    malformed_caps[3] = capsule.make(.ws_session, &missing_binary_accumulator_field);
+    try std.testing.expectError(
+        error.InvalidWebSocket,
+        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+    );
+
+    const stray_binary_accumulator_ws = try ws_snapshot.encode(allocator, .{
+        .fd = 10,
+        .subprotocol = .onyx_irc_media,
+        .binary_message = "stray",
+    });
+    defer allocator.free(stray_binary_accumulator_ws);
+    var stray_binary_accumulator_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = stray_binary_accumulator_ws }};
+    malformed_caps[3] = capsule.make(.ws_session, &stray_binary_accumulator_field);
+    try std.testing.expectError(
+        error.InvalidWebSocket,
+        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+    );
+
+    const oversized_binary = try allocator.alloc(u8, ws_snapshot.max_frame_payload + 1);
+    defer allocator.free(oversized_binary);
+    @memset(oversized_binary, 0xa5);
+    const oversized_binary_ws = try ws_snapshot.encode(allocator, .{
+        .fd = 10,
+        .fragmented = true,
+        .msg_binary = true,
+        .subprotocol = .onyx_irc_media,
+        .binary_message_active = true,
+        .binary_message = oversized_binary,
+    });
+    defer allocator.free(oversized_binary_ws);
+    var oversized_binary_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = oversized_binary_ws }};
+    malformed_caps[3] = capsule.make(.ws_session, &oversized_binary_field);
+    try std.testing.expectError(
+        error.InvalidWebSocket,
+        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+    );
+
+    const text_with_binary_state = try ws_snapshot.encode(allocator, .{
+        .fd = 10,
+        .msg_binary = true,
+        .subprotocol = .ircv3_text,
+    });
+    defer allocator.free(text_with_binary_state);
+    var text_with_binary_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = text_with_binary_state }};
+    malformed_caps[3] = capsule.make(.ws_session, &text_with_binary_field);
+    try std.testing.expectError(
+        error.InvalidWebSocket,
+        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+    );
+
+    // A complete masked zero-payload text frame would already have been
+    // drained by the predecessor. Carrying it as the "partial next frame" is
+    // semantically impossible and must fail before any successor publication.
+    const complete_frame = [_]u8{ 0x81, 0x80, 1, 2, 3, 4 };
+    const complete_frame_ws = try ws_snapshot.encode(allocator, .{
+        .fd = 10,
+        .deframer = &complete_frame,
+    });
+    defer allocator.free(complete_frame_ws);
+    var complete_frame_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = complete_frame_ws }};
+    malformed_caps[3] = capsule.make(.ws_session, &complete_frame_field);
+    try std.testing.expectError(
+        error.InvalidWebSocket,
+        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+    );
+
+    const retained_lf_ws = try ws_snapshot.encode(allocator, .{
+        .fd = 10,
+        .tx = "NOTICE Bob :already-complete\r\npartial",
+    });
+    defer allocator.free(retained_lf_ws);
+    var retained_lf_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = retained_lf_ws }};
+    malformed_caps[3] = capsule.make(.ws_session, &retained_lf_field);
+    try std.testing.expectError(
+        error.InvalidWebSocket,
+        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+    );
+
+    const oversized_tx = try allocator.alloc(u8, ws_snapshot.max_tx_bytes + 1);
+    defer allocator.free(oversized_tx);
+    @memset(oversized_tx, 'x');
+    const oversized_tx_ws = try ws_snapshot.encode(allocator, .{
+        .fd = 10,
+        .tx = oversized_tx,
+    });
+    defer allocator.free(oversized_tx_ws);
+    var oversized_tx_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = oversized_tx_ws }};
+    malformed_caps[3] = capsule.make(.ws_session, &oversized_tx_field);
+    try std.testing.expectError(
+        error.InvalidWebSocket,
+        validateCurrent(&malformed_caps, &.{ 10, 11 }),
+    );
+
+    // v2 has the exact partial-framing fields but no selected application
+    // protocol. It remains cold-decodable by ws_snapshot and is deliberately
+    // rejected by current Helix relation validation.
+    const legacy_ws = ws10[0 .. ws10.len - 6];
+    var legacy_ws_field = [_]capsule.Field{.{ .ordinal = 1, .bytes = legacy_ws }};
+    var legacy_ws_cap = capsule.make(.ws_session, &legacy_ws_field);
+    legacy_ws_cap.header.version = 2;
+    legacy_ws_cap.header.min_supported = 1;
+    legacy_ws_cap.header.max_supported = 2;
+    malformed_caps[3] = legacy_ws_cap;
     try std.testing.expectError(
         error.InvalidWebSocket,
         validateCurrent(&malformed_caps, &.{ 10, 11 }),

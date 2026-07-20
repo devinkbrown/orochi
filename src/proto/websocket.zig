@@ -12,7 +12,11 @@ const Sha1 = std.crypto.hash.Sha1;
 const ACCEPT_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 pub const ACCEPT_LEN = std.base64.standard.Encoder.calcSize(Sha1.digest_length);
-pub const MAX_RESPONSE_LEN = 129;
+pub const IRC_SUBPROTOCOL = "text.ircv3.net";
+/// Onyx extends the IRC text stream with binary Cadence media frames on the
+/// same WebSocket. It must not claim the text-only IRCv3 wire contract.
+pub const ONYX_MEDIA_SUBPROTOCOL = "onyx.irc-media.v1";
+pub const MAX_RESPONSE_LEN = 129 + "Sec-WebSocket-Protocol: ".len + @max(IRC_SUBPROTOCOL.len, ONYX_MEDIA_SUBPROTOCOL.len) + "\r\n".len;
 
 /// HTTP upgrade parsing and response construction failures.
 pub const HandshakeError = error{
@@ -30,6 +34,7 @@ pub const HandshakeError = error{
     InvalidUpgrade,
     InvalidConnection,
     InvalidKey,
+    InvalidSubprotocol,
     UnsupportedVersion,
     OutputTooSmall,
 };
@@ -125,56 +130,39 @@ pub fn computeAccept(key: []const u8, out: *[ACCEPT_LEN]u8) HandshakeError![]con
 
 /// Parse and validate an HTTP/1.1 WebSocket upgrade request.
 pub fn parseHandshake(request: []const u8) HandshakeError!void {
-    const headers = try requestHeaders(request);
-    var cursor: usize = 0;
-    const request_line = nextHeaderLine(headers, &cursor) orelse return error.EmptyRequest;
-    try validateRequestLine(request_line);
-
-    var saw_host = false;
-    var saw_upgrade = false;
-    var saw_connection = false;
-    var saw_key = false;
-    var saw_version = false;
-
-    while (nextHeaderLine(headers, &cursor)) |line| {
-        if (line.len == 0) break;
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHeader;
-        const name = trimHeaderName(line[0..colon]);
-        const value = trimHeaderValue(line[colon + 1 ..]);
-        if (name.len == 0) return error.MalformedHeader;
-
-        if (std.ascii.eqlIgnoreCase(name, "host")) {
-            if (value.len == 0) return error.MalformedHeader;
-            saw_host = true;
-        } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
-            if (!std.ascii.eqlIgnoreCase(value, "websocket")) return error.InvalidUpgrade;
-            saw_upgrade = true;
-        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
-            if (!hasHeaderToken(value, "upgrade")) return error.InvalidConnection;
-            saw_connection = true;
-        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
-            var accept_buf: [ACCEPT_LEN]u8 = undefined;
-            _ = try computeAccept(value, &accept_buf);
-            saw_key = true;
-        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
-            if (!std.mem.eql(u8, value, "13")) return error.UnsupportedVersion;
-            saw_version = true;
-        }
-    }
-
-    if (!saw_host) return error.MissingHost;
-    if (!saw_upgrade) return error.MissingUpgrade;
-    if (!saw_connection) return error.MissingConnection;
-    if (!saw_key) return error.MissingKey;
-    if (!saw_version) return error.MissingVersion;
+    _ = try parseHandshakeRequest(request);
 }
 
 /// Build the complete 101 Switching Protocols response into `out`.
 pub fn buildHandshakeResponse(request: []const u8, out: []u8) HandshakeError![]const u8 {
-    const key = try findHandshakeKey(request);
+    return (try buildHandshakeResponseWithSelection(request, out)).response;
+}
+
+/// A validated opening response plus the exact application protocol selected
+/// for this connection. The daemon retains this result to enforce frame types
+/// and preserve the contract across Helix.
+pub const HandshakeResult = struct {
+    response: []const u8,
+    subprotocol: ?Subprotocol,
+};
+
+pub fn buildHandshakeResponseWithSelection(request: []const u8, out: []u8) HandshakeError!HandshakeResult {
+    const handshake = try parseHandshakeRequest(request);
     var accept_buf: [ACCEPT_LEN]u8 = undefined;
-    const accept = try computeAccept(key, &accept_buf);
-    return std.fmt.bufPrint(
+    const accept = try computeAccept(handshake.key, &accept_buf);
+    if (handshake.subprotocol) |subprotocol| {
+        const bytes = std.fmt.bufPrint(
+            out,
+            "HTTP/1.1 101 Switching Protocols\r\n" ++
+                "Upgrade: websocket\r\n" ++
+                "Connection: Upgrade\r\n" ++
+                "Sec-WebSocket-Accept: {s}\r\n" ++
+                "Sec-WebSocket-Protocol: {s}\r\n\r\n",
+            .{ accept, subprotocol.wireName() },
+        ) catch return error.OutputTooSmall;
+        return .{ .response = bytes, .subprotocol = subprotocol };
+    }
+    const bytes = std.fmt.bufPrint(
         out,
         "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -182,6 +170,7 @@ pub fn buildHandshakeResponse(request: []const u8, out: []u8) HandshakeError![]c
             "Sec-WebSocket-Accept: {s}\r\n\r\n",
         .{accept},
     ) catch return error.OutputTooSmall;
+    return .{ .response = bytes, .subprotocol = null };
 }
 
 /// Decode one complete WebSocket frame from `input`.
@@ -324,10 +313,13 @@ pub const DeframeEvent = union(enum) {
     /// Unmasked payload of one text/binary/continuation DATA frame. `fin` marks
     /// the end of the WebSocket message (so a line-oriented consumer can treat
     /// the frame boundary as a message terminator even without a trailing CRLF).
+    /// `continuation` preserves whether this event came from a continuation
+    /// frame. Consumers must not infer that identity from the Deframer's mutable
+    /// fragmentation state because a queued event may already have advanced it.
     /// `binary` reflects the message's opcode (set by its opening frame and
     /// inherited by continuations) so a consumer can route binary media datagrams
     /// away from the line-oriented text path.
-    data: struct { payload: []const u8, fin: bool, binary: bool },
+    data: struct { payload: []const u8, fin: bool, binary: bool, continuation: bool },
     /// Client ping; the caller should answer with a pong echoing the payload.
     ping: []const u8,
     /// Client pong (unsolicited or answering a server ping); informational.
@@ -350,7 +342,7 @@ pub fn Deframer(comptime max_frame_size: usize) type {
         /// Header (2) + extended length (8) + mask key (4) on top of the payload.
         const max_overhead = 14;
         const PendingEvent = union(enum) {
-            data: struct { len: usize, fin: bool },
+            data: struct { len: usize, fin: bool, continuation: bool },
             ping: usize,
             pong: void,
             close: usize,
@@ -459,12 +451,20 @@ pub fn Deframer(comptime max_frame_size: usize) type {
                     if (self.fragmented) return error.NestedFragmentation;
                     self.fragmented = !frame.fin;
                     self.msg_binary = frame.opcode == .binary;
-                    self.pending = .{ .data = .{ .len = frame.payload.len, .fin = frame.fin } };
+                    self.pending = .{ .data = .{
+                        .len = frame.payload.len,
+                        .fin = frame.fin,
+                        .continuation = false,
+                    } };
                 },
                 .continuation => {
                     if (!self.fragmented) return error.UnexpectedContinuation;
                     if (frame.fin) self.fragmented = false;
-                    self.pending = .{ .data = .{ .len = frame.payload.len, .fin = frame.fin } };
+                    self.pending = .{ .data = .{
+                        .len = frame.payload.len,
+                        .fin = frame.fin,
+                        .continuation = true,
+                    } };
                 },
                 .ping => self.pending = .{ .ping = frame.payload.len },
                 .pong => self.pending = .pong,
@@ -478,12 +478,22 @@ pub fn Deframer(comptime max_frame_size: usize) type {
                     if (self.fragmented) return error.NestedFragmentation;
                     self.fragmented = !frame.fin;
                     self.msg_binary = frame.opcode == .binary;
-                    return .{ .data = .{ .payload = frame.payload, .fin = frame.fin, .binary = self.msg_binary } };
+                    return .{ .data = .{
+                        .payload = frame.payload,
+                        .fin = frame.fin,
+                        .binary = self.msg_binary,
+                        .continuation = false,
+                    } };
                 },
                 .continuation => {
                     if (!self.fragmented) return error.UnexpectedContinuation;
                     if (frame.fin) self.fragmented = false;
-                    return .{ .data = .{ .payload = frame.payload, .fin = frame.fin, .binary = self.msg_binary } };
+                    return .{ .data = .{
+                        .payload = frame.payload,
+                        .fin = frame.fin,
+                        .binary = self.msg_binary,
+                        .continuation = true,
+                    } };
                 },
                 .ping => return .{ .ping = frame.payload },
                 .pong => return .pong,
@@ -493,7 +503,12 @@ pub fn Deframer(comptime max_frame_size: usize) type {
 
         fn eventFromPending(self: *Self, pending: PendingEvent) DeframeEvent {
             return switch (pending) {
-                .data => |data| .{ .data = .{ .payload = self.payload_buf[0..data.len], .fin = data.fin, .binary = self.msg_binary } },
+                .data => |data| .{ .data = .{
+                    .payload = self.payload_buf[0..data.len],
+                    .fin = data.fin,
+                    .binary = self.msg_binary,
+                    .continuation = data.continuation,
+                } },
                 .ping => |len| .{ .ping = self.payload_buf[0..len] },
                 .pong => .pong,
                 .close => |len| .{ .close = self.payload_buf[0..len] },
@@ -518,7 +533,24 @@ fn requestHeaders(request: []const u8) HandshakeError![]const u8 {
     return request[0 .. end + 2];
 }
 
-fn findHandshakeKey(request: []const u8) HandshakeError![]const u8 {
+const ParsedHandshake = struct {
+    key: []const u8,
+    subprotocol: ?Subprotocol,
+};
+
+pub const Subprotocol = enum(u8) {
+    ircv3_text,
+    onyx_irc_media,
+
+    pub fn wireName(self: Subprotocol) []const u8 {
+        return switch (self) {
+            .ircv3_text => IRC_SUBPROTOCOL,
+            .onyx_irc_media => ONYX_MEDIA_SUBPROTOCOL,
+        };
+    }
+};
+
+fn parseHandshakeRequest(request: []const u8) HandshakeError!ParsedHandshake {
     const headers = try requestHeaders(request);
     var cursor: usize = 0;
     const request_line = nextHeaderLine(headers, &cursor) orelse return error.EmptyRequest;
@@ -529,13 +561,14 @@ fn findHandshakeKey(request: []const u8) HandshakeError![]const u8 {
     var saw_upgrade = false;
     var saw_connection = false;
     var saw_version = false;
+    var subprotocol: ?Subprotocol = null;
 
     while (nextHeaderLine(headers, &cursor)) |line| {
         if (line.len == 0) break;
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.MalformedHeader;
-        const name = trimHeaderName(line[0..colon]);
+        const name = line[0..colon];
         const value = trimHeaderValue(line[colon + 1 ..]);
-        if (name.len == 0) return error.MalformedHeader;
+        if (!validHttpToken(name)) return error.MalformedHeader;
 
         if (std.ascii.eqlIgnoreCase(name, "host")) {
             if (value.len == 0) return error.MalformedHeader;
@@ -553,6 +586,9 @@ fn findHandshakeKey(request: []const u8) HandshakeError![]const u8 {
         } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
             if (!std.mem.eql(u8, value, "13")) return error.UnsupportedVersion;
             saw_version = true;
+        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-protocol")) {
+            const offered = try firstSupportedSubprotocol(value);
+            if (subprotocol == null) subprotocol = offered;
         }
     }
 
@@ -561,7 +597,7 @@ fn findHandshakeKey(request: []const u8) HandshakeError![]const u8 {
     if (!saw_connection) return error.MissingConnection;
     if (key == null) return error.MissingKey;
     if (!saw_version) return error.MissingVersion;
-    return key.?;
+    return .{ .key = key.?, .subprotocol = subprotocol };
 }
 
 fn validateRequestLine(line: []const u8) HandshakeError!void {
@@ -584,10 +620,6 @@ fn nextHeaderLine(headers: []const u8, cursor: *usize) ?[]const u8 {
     return line;
 }
 
-fn trimHeaderName(value: []const u8) []const u8 {
-    return std.mem.trim(u8, value, " \t");
-}
-
 fn trimHeaderValue(value: []const u8) []const u8 {
     return std.mem.trim(u8, value, " \t");
 }
@@ -598,6 +630,33 @@ fn hasHeaderToken(value: []const u8, token: []const u8) bool {
         if (std.ascii.eqlIgnoreCase(trimHeaderValue(part), token)) return true;
     }
     return false;
+}
+
+/// Parse RFC 6455's `1#token` offer. A malformed list invalidates the opening
+/// handshake; silently downgrading it to the legacy no-protocol path would make
+/// the server accept syntax that the WebSocket ABNF rejects.
+fn firstSupportedSubprotocol(value: []const u8) HandshakeError!?Subprotocol {
+    var selected: ?Subprotocol = null;
+    var parts = std.mem.splitScalar(u8, value, ',');
+    while (parts.next()) |part| {
+        const offered = trimHeaderValue(part);
+        if (!validHttpToken(offered)) return error.InvalidSubprotocol;
+        if (selected == null and std.mem.eql(u8, offered, IRC_SUBPROTOCOL)) selected = .ircv3_text;
+        if (selected == null and std.mem.eql(u8, offered, ONYX_MEDIA_SUBPROTOCOL)) selected = .onyx_irc_media;
+    }
+    return selected;
+}
+
+fn validHttpToken(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| {
+        const valid = std.ascii.isAlphanumeric(byte) or switch (byte) {
+            '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~' => true,
+            else => false,
+        };
+        if (!valid) return false;
+    }
+    return true;
 }
 
 fn opcodeFromRaw(raw: u4) FrameError!Opcode {
@@ -643,7 +702,144 @@ test "canonical RFC 6455 handshake example" {
     );
 }
 
+test "handshake selects text.ircv3.net from comma and OWS protocol offers" {
+    const request =
+        "GET /chat HTTP/1.1\r\n" ++
+        "Host: example.com:8000\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: keep-alive, Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "Sec-WebSocket-Protocol: chat,\ttext.ircv3.net  , binary\r\n\r\n";
+
+    try parseHandshake(request);
+    var response_buf: [MAX_RESPONSE_LEN]u8 = undefined;
+    const response = try buildHandshakeResponse(request, &response_buf);
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+            "Sec-WebSocket-Protocol: text.ircv3.net\r\n\r\n",
+        response,
+    );
+}
+
+test "handshake never echoes absent or unrelated valid subprotocol offers" {
+    const request_prefix =
+        "GET /chat HTTP/1.1\r\n" ++
+        "Host: example.com:8000\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n";
+    const offers = [_][]const u8{
+        "chat, binary",
+        "TEXT.IRCV3.NET",
+        "text.ircv3.net.evil",
+    };
+
+    for (offers) |offer| {
+        var request_buf: [512]u8 = undefined;
+        const request = try std.fmt.bufPrint(
+            &request_buf,
+            "{s}Sec-WebSocket-Protocol: {s}\r\n\r\n",
+            .{ request_prefix, offer },
+        );
+        try parseHandshake(request);
+        var response_buf: [MAX_RESPONSE_LEN]u8 = undefined;
+        const response = try buildHandshakeResponse(request, &response_buf);
+        try std.testing.expect(std.mem.indexOf(u8, response, "Sec-WebSocket-Protocol:") == null);
+        try std.testing.expectEqual(@as(usize, 129), response.len);
+    }
+}
+
+test "handshake rejects malformed subprotocol lists" {
+    const request_prefix =
+        "GET /chat HTTP/1.1\r\n" ++
+        "Host: example.com:8000\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n";
+    const malformed_offers = [_][]const u8{
+        "",
+        "\"text.ircv3.net\"",
+        "text.ircv3.net extra",
+        ",text.ircv3.net",
+        "text.ircv3.net,",
+        "chat,,text.ircv3.net",
+        ",\t,",
+    };
+
+    for (malformed_offers) |offer| {
+        var request_buf: [512]u8 = undefined;
+        const request = try std.fmt.bufPrint(
+            &request_buf,
+            "{s}Sec-WebSocket-Protocol: {s}\r\n\r\n",
+            .{ request_prefix, offer },
+        );
+        try std.testing.expectError(error.InvalidSubprotocol, parseHandshake(request));
+    }
+}
+
+test "handshake recognizes text.ircv3.net across repeated protocol headers" {
+    const request =
+        "GET /chat HTTP/1.1\r\n" ++
+        "Host: example.com:8000\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "Sec-WebSocket-Protocol: chat\r\n" ++
+        "sec-websocket-protocol:\ttext.ircv3.net\t\r\n\r\n";
+
+    var response_buf: [MAX_RESPONSE_LEN]u8 = undefined;
+    const response = try buildHandshakeResponse(request, &response_buf);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, response, "Sec-WebSocket-Protocol: text.ircv3.net"));
+}
+
+test "handshake selects the first supported offered subprotocol" {
+    const request =
+        "GET /chat HTTP/1.1\r\n" ++
+        "Host: example.com:8000\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "Sec-WebSocket-Protocol: chat, text.ircv3.net, onyx.irc-media.v1\r\n\r\n";
+
+    var response_buf: [MAX_RESPONSE_LEN]u8 = undefined;
+    const response = try buildHandshakeResponse(request, &response_buf);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Sec-WebSocket-Protocol: text.ircv3.net\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Sec-WebSocket-Protocol: onyx.irc-media.v1\r\n") == null);
+}
+
+test "handshake selects Onyx media when the client offers it first" {
+    const request =
+        "GET /chat HTTP/1.1\r\n" ++
+        "Host: example.com:8000\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Connection: Upgrade\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        "Sec-WebSocket-Protocol: onyx.irc-media.v1, text.ircv3.net\r\n\r\n";
+
+    var response_buf: [MAX_RESPONSE_LEN]u8 = undefined;
+    const result = try buildHandshakeResponseWithSelection(request, &response_buf);
+    try std.testing.expectEqual(Subprotocol.onyx_irc_media, result.subprotocol.?);
+    try std.testing.expect(std.mem.indexOf(u8, result.response, "Sec-WebSocket-Protocol: onyx.irc-media.v1\r\n") != null);
+}
+
 test "handshake rejects malformed and missing required headers" {
+    try std.testing.expectError(error.MalformedHeader, parseHandshake(
+        "GET /chat HTTP/1.1\r\n" ++
+            "Host : example.com\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n\r\n",
+    ));
     try std.testing.expectError(error.UnsupportedMethod, parseHandshake(
         "POST /chat HTTP/1.1\r\n" ++
             "Host: example.com\r\n" ++
