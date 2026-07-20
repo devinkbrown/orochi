@@ -1,0 +1,33 @@
+# External BoGo baseline for BoringSSL
+# 5ac7567c234514157a504ff3fbedc0f5eddbf678.
+#
+# Format: PASS|SKIP <exact runner test name>. The default tools/bogo.sh run
+# selects exactly these cases and fails on any outcome drift. DisabledTests in
+# config.json remain the authority for deliberate modern-only exclusions.
+SKIP CheckClientCertificateTypes
+SKIP SendFallbackSCSV
+SKIP ClientCertificateTypes
+PASS BadFinished-Server
+PASS ServerCipherFilter-RSA
+PASS ServerCipherFilter-ECDSA
+PASS UnknownCipher
+PASS ServerCipherFilter-Ed25519
+PASS VersionNegotiationExtension-TLS12-TLS
+PASS NoSupportedVersions
+PASS VersionTooLow
+PASS NoSSL3-Server
+PASS Downgrade-TLS12-Server-TLS
+PASS MinimumVersion-Server2-TLS12-TLS12-TLS
+PASS Server-SignDefault-RSA_PKCS1_SHA256-TLS12
+PASS UnknownCurve
+PASS PointFormat-Server-Tolerance
+PASS PointFormat-Server-Missing
+PASS CheckECDSACurve-TLS12
+PASS Basic-Server-ECDHE-RSA-TLS-Sync
+PASS Basic-Server-ECDHE-ECDSA-TLS-Sync
+PASS SessionTicketsDisabled-Server-TLS-Sync
+PASS Basic-Server-ECDHE-ECDSA-TLS-Sync-PackHandshake
+PASS Basic-Server-ECDHE-RSA-TLS-Sync-PackHandshake
+PASS SessionTicketsDisabled-Server-TLS-Sync-PackHandshake
+PASS TrailingMessageData-ClientFinished-TLS
+PASS ExpectOmitExtensions

@@ -32,9 +32,12 @@ jobs:
           else
             url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           fi
-          curl -fsSL "$url" -o /tmp/zig.tar.xz
-          tar -xf /tmp/zig.tar.xz -C /tmp
-          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          archive="${GITHUB_WORKSPACE}/.ci/zig.tar.xz"
+          install_root="${GITHUB_WORKSPACE}/.ci"
+          mkdir -p "${install_root}"
+          curl -fsSL "$url" -o "${archive}"
+          tar -xf "${archive}" -C "${install_root}"
+          echo "${install_root}/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - run: zig version
       # `zig build check` semantically analyses the daemon without emitting a
       # binary — the fastest signal that the tree still compiles.
@@ -56,9 +59,12 @@ jobs:
           else
             url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           fi
-          curl -fsSL "$url" -o /tmp/zig.tar.xz
-          tar -xf /tmp/zig.tar.xz -C /tmp
-          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          archive="${GITHUB_WORKSPACE}/.ci/zig.tar.xz"
+          install_root="${GITHUB_WORKSPACE}/.ci"
+          mkdir -p "${install_root}"
+          curl -fsSL "$url" -o "${archive}"
+          tar -xf "${archive}" -C "${install_root}"
+          echo "${install_root}/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       - run: zig version
       - name: Build (debug)
         run: zig build
@@ -80,6 +86,57 @@ jobs:
       - name: Run deterministic assurance suite
         run: zig build all-checks-verbose --summary all
 
+  bogo:
+    name: external BoGo TLS interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${ZIG_VERSION}" == *"-dev."* ]]; then
+            url="https://ziglang.org/builds/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          else
+            url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          fi
+          archive="${GITHUB_WORKSPACE}/.ci/zig.tar.xz"
+          install_dir="${GITHUB_WORKSPACE}/.ci/zig-${ZIG_VERSION}"
+          curl -fsSL "${url}" -o "${archive}"
+          mkdir -p "${install_dir}"
+          tar -xf "${archive}" -C "${install_dir}" --strip-components=1
+          echo "${install_dir}" >> "${GITHUB_PATH}"
+      - uses: actions/setup-go@v5
+        with:
+          # The pinned BoringSSL go.mod requires this exact toolchain.
+          go-version: "1.25.8"
+          cache: false
+      - name: Cache pinned runner and Go build state
+        uses: actions/cache@v4
+        with:
+          path: |
+            .bogo/boringssl
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: bogo-${{ runner.os }}-go1.25.8-5ac7567c234514157a504ff3fbedc0f5eddbf678
+      - name: Verify shim self-test
+        run: zig build bogo-shim-test --summary all
+      - name: Force the ephemeral runner onto IPv4 loopback
+        # BoringSSL prefers ::1 and adds -ipv6, while the bounded Onyx shim is
+        # IPv4-only. This job owns its disposable VM, so disabling IPv6 here is
+        # safer and more portable than relying on unprivileged user namespaces.
+        run: sudo sysctl -q -w net.ipv6.conf.all.disable_ipv6=1
+      - name: Run required external baseline
+        env:
+          BOGO_CACHE_DIR: ${{ github.workspace }}/.bogo
+          BOGO_USE_IPV4_NETNS: "0"
+          # The shim is intentionally serialized: concurrent external peers can
+          # consume its bounded handshake deadline and turn valid cases into
+          # scheduler-dependent timeouts on shared runners.
+          BOGO_NUM_WORKERS: "1"
+        run: tools/bogo.sh
+
   release:
     name: release build (x86_64-linux-musl)
     runs-on: ubuntu-latest
@@ -95,9 +152,12 @@ jobs:
           else
             url="https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
           fi
-          curl -fsSL "$url" -o /tmp/zig.tar.xz
-          tar -xf /tmp/zig.tar.xz -C /tmp
-          echo "/tmp/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          archive="${GITHUB_WORKSPACE}/.ci/zig.tar.xz"
+          install_root="${GITHUB_WORKSPACE}/.ci"
+          mkdir -p "${install_root}"
+          curl -fsSL "$url" -o "${archive}"
+          tar -xf "${archive}" -C "${install_root}"
+          echo "${install_root}/zig-x86_64-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
       # The static-musl ReleaseFast binary is the production artifact — verify it
       # links and produces a stripped executable on every change.
       - name: Build static musl release
