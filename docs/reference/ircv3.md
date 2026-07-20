@@ -41,7 +41,7 @@ Status legend:
 | search | CHATHISTORY inverted index + `SEARCH` handler | Implemented |
 | event-playback | Lotus channel-event entries + `draft/event-playback` replay gate | Implemented |
 | sts | `proto/sts.zig` | Implemented |
-| websocket | `proto/websocket.zig` | Implemented |
+| websocket | `proto/websocket.zig` + daemon WebSocket adapter | Implemented (negotiated text/media protocols, bounded binary) |
 | whox | `proto/who.zig` | Implemented |
 | account-extban | `proto/extban.zig` + `ACCOUNTEXTBAN` ISUPPORT/CAP | Implemented |
 | bot-mode | `proto/bot_mode.zig` (RPL_WHOISBOT 335, BOT isupport) | Implemented (wired into dispatch) |
@@ -64,3 +64,19 @@ Status legend:
 Notes: `metadata` (IRCv3) and IRCX `PROP` are two takes on the same idea — Onyx Server exposes one
 unified property system (lean IRCX `PROP` with a metadata-compatible view). `oper-tag` integrates with
 the SASL-only oper system. `labeled-response` rides the `batch` machinery.
+
+## WebSocket application protocols
+
+WebSocket clients may offer `onyx.irc-media.v1` and `text.ircv3.net`; the
+server selects the first supported token in the client's offered order. The
+Onyx client offers the media protocol first and the IRCv3 text protocol as its
+fallback. `text.ircv3.net` accepts exactly one CR/LF-free IRC message per text
+frame and rejects binary frames. `onyx.irc-media.v1` adds bounded Cadence binary
+datagrams while retaining text IRC frames. A client that offers no protocol is
+accepted in the explicit legacy compatibility mode.
+
+Inbound frame payloads and fragmented binary application messages are bounded
+at 4 MiB. Malformed framing and protocol mismatches close with RFC 6455 status
+1002; frame or aggregate size violations close with 1009. The selected protocol
+and any in-progress bounded fragmented-binary accumulator are preserved by the
+current Helix WebSocket capsule.
