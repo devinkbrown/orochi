@@ -262,10 +262,14 @@ Require all of the following before declaring the mesh healthy:
    nick and account;
 2. the server reports certificate-authenticated session restoration rather than
    creating a guest or collision nick;
-3. each client can author one channel message and one direct message;
-4. every marker arrives exactly once on both clients, with identical `time` and
+3. every restored channel receives its unsolicited `353` roster followed by
+   `366` immediately after the restore bootstrap, without waiting for a client
+   `NAMES` poll; parse the final `353` parameter as a trailing field and require
+   the requested nick exactly once, including its expected status prefix;
+4. each client can author one channel message and one direct message;
+5. every marker arrives exactly once on both clients, with identical `time` and
    `msgid` tags on the two transports; and
-5. attaching the second client does not emit `MODE #channel +Y nick`. A cold
+6. attaching the second client does not emit `MODE #channel +Y nick`. A cold
    process may publish one genuine first grant transition while reconstructing
    state, but later attachments and unchanged grant refreshes must stay silent.
 
