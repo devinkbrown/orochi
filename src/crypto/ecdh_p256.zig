@@ -18,7 +18,7 @@
 //! CSPRNG inside `generate`), 64-bit targets only.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const random_mod = @import("random.zig");
 
 const P256 = std.crypto.ecc.P256;
 const scalar = P256.scalar;
@@ -62,19 +62,7 @@ comptime {
 ///
 /// Always makes a fresh syscall rather than depending on stored process state.
 fn osEntropy(buf: []u8) EcdhError!void {
-    switch (builtin.os.tag) {
-        .linux => {
-            var filled: usize = 0;
-            while (filled < buf.len) {
-                const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
-                const signed: isize = @bitCast(rc);
-                if (signed < 0) return error.EntropyUnavailable;
-                if (rc == 0) return error.EntropyUnavailable;
-                filled += rc;
-            }
-        },
-        else => return error.EntropyUnavailable,
-    }
+    random_mod.fillOsEntropy(buf) catch return error.EntropyUnavailable;
 }
 
 /// Derive the public key for a validated private scalar.
