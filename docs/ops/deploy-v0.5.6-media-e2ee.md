@@ -10,16 +10,18 @@ and binary names; those literals are not new product naming.
 
 | Item | Value |
 | --- | --- |
-| Server source commit | `60a50cf` (`Complete attachment-safe media encryption`) |
+| E2EE source commit | `60a50cf` (`Complete attachment-safe media encryption`) |
+| Deployed source tree | `c78f1c3` (E2EE release plus merged Armor entropy portability fix) |
 | Client commit | `4f42356` (`Complete attachment-safe media encryption`) |
-| Version banner | `Onyx Server 0.5.6+60a50cf` |
+| Version banner | `Onyx Server 0.5.6+c78f1c3` |
 | Server artifact | `zig-out/bin/onyx-server` |
-| Artifact SHA-256 | `cd51ebe3f437a02bb20dc3f132f15fcfe69a512994183e82eb10c40fe5581d8b` |
+| Artifact SHA-256 | `711d4ed1c5ccf414a750a40316a41c9235f22aa7837683a7ba94d96e9d57c64e` |
 | Reviewer | fresh independent high/critical security review: `PASS`, no remaining finding |
 
-The server release passed `zig build all-checks --summary all`: 18/18 steps,
-7,818 tests passed, 4 skipped, zero failed. The focused ReleaseSafe server lane
-passed, as did the clean static x86_64 Linux artifact build and diff checks.
+After the remote Armor portability commit was merged, the final source tree
+passed `zig build all-checks --summary all`: 18/18 steps, 7,818 tests passed, 4
+skipped, zero failed. The full ReleaseSafe server lane passed again, as did the
+clean static x86_64 Linux artifact build and diff checks.
 
 The Onyx client passed 399 test files and 5,189 tests, typecheck, production
 build, and lint with zero errors. Seven existing Solid reactivity warnings in
@@ -32,15 +34,15 @@ build, and lint with zero errors. Seven existing Solid reactivity warnings in
 | Live unit | `orochi.service` | `orochi.service` |
 | Live binary | `/home/kain/orochi-run/orochi` | `/home/trev/orochi-run/orochi` |
 | Config | `/home/kain/orochi-run/orochi.local.toml` | `/home/trev/orochi-run/orochi.ircxus.toml` |
-| Binary rollback | `orochi.rollback-pre-60a50cf` | `orochi.rollback-pre-60a50cf` |
-| Config backup | `orochi.local.toml.pre-60a50cf` | `orochi.ircxus.toml.pre-60a50cf` |
-| Restart time | 2026-07-20 05:53:50 CEST | 2026-07-19 20:53:50 PDT |
-| Initial PID | `1651768` | `614438` |
+| Binary rollback | `orochi.rollback-pre-c78f1c3` | `orochi.rollback-pre-c78f1c3` |
+| Config backup | `orochi.local.toml.pre-c78f1c3` | `orochi.ircxus.toml.pre-c78f1c3` |
+| Restart time | 2026-07-20 06:26:53 CEST | 2026-07-19 21:26:54 PDT |
+| Initial PID | `1670376` | `615538` |
 
 The same artifact SHA was verified on both nodes. Each preserved production
 config passed the staged binary's `--check-config` before replacement. The
 deployment introduced no configuration change. Both services were hard
-restarted at the same UTC instant and reported `0.5.6+60a50cf`.
+restarted together and reported `0.5.6+c78f1c3`.
 
 After activation, both metrics endpoints reported quorum 1, partitioned 0, one
 connected component, and one of one mesh peers up. Startup logs had no crash,
@@ -53,9 +55,10 @@ The saved WeeChat profiles `ircx` and `ircx.us` use
 account/nick `kain`. The certificate file is mode 0600, has subject
 `CN=eshmaki.me`, and is valid through 2026-08-23.
 
-After the release, an explicit WeeChat reconnect completed as `kain` and
-reported `SESSION RESUME: certificate-authenticated session restored`. It did
-not emit `MODE #root +Y kain`.
+After the final restart, an explicit WeeChat reconnect presented the configured
+client certificate, completed SASL EXTERNAL as `kain`, ran against
+`0.5.6+c78f1c3`, and reported `SESSION RESUME: certificate-authenticated
+session restored`. It did not emit `MODE #root +Y kain`.
 
 Two concurrent OpenSSL-backed certificate clients were then held open, one on
 each mesh node. Each authored a channel marker and a direct-message marker. All
@@ -92,11 +95,11 @@ The Onyx site was deployed from client commit `4f42356`. Routes `/`, `/stats/`,
 `/integrations/`, `/agents/`, `/app/`, and `/sw.js` returned HTTP 200. The live
 service worker cache is `onyx-shell-20260720-052915-4f42356`.
 
-The stats feed was populated with current `#root` data: 29 messages, 5 active
-users, 7 present users, and one network day at the acceptance snapshot. The
-user `announce.service` detected and announced both release commits, recovered
-after the planned local restart, and updated the topic to the current client
-and server source commits.
+The stats feed was populated with current `#root` data: 53 messages, 6 active
+users, 6 present users, and one network day at the final acceptance snapshot.
+The user `announce.service` detected and announced both release commits,
+recovered after the planned local restart, and updated the topic to the current
+client and server source commits.
 
 ## Known boundaries
 
