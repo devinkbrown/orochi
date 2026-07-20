@@ -274,6 +274,35 @@ can contain similarly named profiles such as `ircx` and `ircx.us`; inspect each
 profile that users invoke and require `tls_cert`, `sasl_mechanism=external`, the
 intended account/nick, and reconnect policy to be set explicitly.
 
+### Media E2EE release acceptance
+
+Treat client-held media E2EE as a client/server release. Before activation:
+
+1. run the complete client unit suite, typecheck, lint, and production build;
+2. run `zig build all-checks --summary all`, the affected ReleaseSafe server
+   lane, a clean static release build, and `git diff --check`;
+3. require tests that reject a bad version, length, enrolled key, signature,
+   channel transcript, attachment, stream, kind, MAC, epoch, and replay without
+   publishing or mutating call state;
+4. exercise at least three physical clients, including same-nick attachments,
+   leader detach, leader disconnect, rejoin, re-handshake, `PART`, `KICK`, nick
+   change, successful account mutation, failed authentication, and old-frame
+   rejection after retirement; and
+5. obtain a fresh security review of the handshake, lifecycle, and WebSocket
+   ingress changes. Reproduce each finding against the release tree rather than
+   accepting the review result uncritically.
+
+After both nodes are restarted, require healthy mesh metrics (`quorum=1`,
+`partitioned=0`, one component, and all configured peers up), repeat the
+two-client certificate routing acceptance above, and confirm that E2EE control
+events traverse the mesh exactly once. Smoke the deployed browser application,
+service worker, status, roadmap, and stats data—not only its build output.
+
+The v2 gate does not prove cross-node binary WebSocket media delivery. Control
+events are mesh-wide, but encrypted binary media forwarding is node-local until
+an explicit mesh cascade is implemented and accepted with real media frames.
+Do not describe a two-node control-plane test as cross-node media delivery.
+
 `status.json` and channel stats are file outputs, not daemon-owned HTTP routes. Serve
 the configured stats directory with nginx or another static file server if needed.
 
@@ -288,6 +317,7 @@ the configured stats directory with nginx or another static file server if neede
 | Mesh peer absent after reload | Peer link not reattached or redial still pending | Inspect `/INFO`, `/STATS l`, status feed, and `[mesh].connect`; verify peer listener reachability. |
 | Metrics unavailable | `[metrics].listen = 0`, bind failure, or loopback-only bind | Check config and startup logs; default bind is loopback unless widened deliberately. |
 | WebSocket/WebTransport disabled | TLS cert/key material missing or listener disabled | Check `[tls]`, `[listen].ws`, `[listen].webtransport`, and boot logs. |
+| Python `ssl` receives a TLS 1.3 `decode_error` while WeeChat and OpenSSL clients work | Armor record interoperability differs for that client stack; certificate presentation alone does not isolate the record-path failure | Preserve a packet/log trace, reproduce with a minimal Python client against both nodes, and inspect the Armor TLS record parser. Do not weaken certificate or signature validation as a workaround. |
 
 ## CI And Release Expectations
 

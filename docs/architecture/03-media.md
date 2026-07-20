@@ -117,6 +117,97 @@ Media presence rides the IRCX EVENT plane as `MEDIA <action> <channel> <nick> [d
 
 Targeted secrets and transport material are not broadcast. `sendMediaEventReply` renders caller-only MEDIA replies, and `MACKEY` is derived per participant and sent only to the owning WebSocket session. Evidence: `src/daemon/server.zig:18088`, `src/daemon/server.zig:18104`, `src/daemon/server.zig:26351`, `src/daemon/server.zig:26355`, `src/daemon/server.zig:26365`.
 
+## Client-held media E2EE v2
+
+Native WebSocket media can use the v2 end-to-end encryption protocol. Media
+keys are created and retained by clients; Onyx Server never receives a group
+key and cannot decrypt a media payload. The daemon is the authenticated control
+plane: it verifies that a physical connection is entitled to speak for an exact
+`nick:attachment`, publishes signed handshake material to call members, and
+rejects frames that do not match the connection's bound attachment, stream,
+kind, or server MAC.
+
+### Signed attachment handshake
+
+The binary handshake envelope is exactly 275 bytes:
+
+| Offset | Length | Field |
+| ---: | ---: | --- |
+| 0 | 1 | protocol version, `2` |
+| 1 | 16 | physical attachment id |
+| 17 | 65 | static P-256 public key |
+| 82 | 65 | per-call ephemeral P-256 public key |
+| 147 | 32 | fresh nonce |
+| 179 | 32 | enrolled Ed25519 public key |
+| 211 | 64 | Ed25519 signature |
+
+The signed transcript is the first 211 envelope bytes prefixed by the ASCII
+domain `onyx-media-handshake-v2\0`, followed by the raw UTF-8 channel bytes
+with only ASCII `A-Z` folded to lowercase, and a final NUL. The daemon builds
+the same byte sequence in `mediaE2eeHandshakeTranscript`, requires the Ed25519
+key to match the authenticated account enrollment, and verifies the signature
+with `mediaE2eeHandshakeSignatureValid` before it mutates call state, binds the
+attachment, or publishes the handshake. A malformed, unsigned, mismatched, or
+legacy envelope fails closed.
+
+The ephemeral P-256 key is regenerated for each call. Clients derive pairwise
+wrapping secrets with ECDH, use the enrolled Ed25519 identity to authenticate
+the exchange, and bind trust-on-first-use identity to both the static P-256 and
+Ed25519 public keys. Reusing a nick does not merge physical clients: the
+authority and routing identity is always the full `nick:attachment` tuple.
+
+### Group keys and encrypted frames
+
+The elected client leader distributes a group epoch over the member-scoped
+EVENT plane with the exact signaling shape:
+
+```text
+MEDIA GROUPKEY <channel> <sender-nick> <sender-attachment> <target-nick> <target-attachment> <epoch> <wrapped-key>
+```
+
+Only the exact target attachment can unwrap the key. Generation and epoch
+checks reject stale leadership, replay, and equal-epoch collisions. A detached
+observer retains room epoch and participant metadata but no media key material;
+it follows the remaining deterministic leader and accepts only a later,
+server-authenticated distribution. This is exercised with three-member calls,
+leader departure, detach/rejoin, and a pending lower-ranked leader.
+
+Each media frame is encrypted client-side with AES-GCM and signed by its sender
+with Ed25519. The associated metadata binds the channel generation, key epoch,
+sender attachment, stream, media kind, and sequence. `handleWsMediaDatagram`
+also requires current physical call membership and validates the server-issued
+MAC plus the bound attachment, stream, and kind before relaying the opaque
+ciphertext. The daemon does not offer a plaintext fallback and does not accept
+v1 handshake downgrade.
+
+### Physical-attachment retirement
+
+Media authority follows the socket, not merely the shared account or nick.
+`retireMediaPhysicalChannel`, `retireLogicalMediaBeforeNickMutation`, and
+`retireMediaBeforeAccountMutation` make retirement explicit:
+
+| Transition | Required result |
+| --- | --- |
+| same attachment re-handshakes as a new attachment | publish exact `E2EE-DETACH` for the old attachment before binding the new one |
+| explicit `MEDIA LEAVE` or disconnect | retire only that physical attachment; publish nick-wide leave only after the final attachment leaves |
+| `PART` or `KICK` | retire affected physical media membership before channel membership is removed |
+| successful nick change | retire the old nick authority and require a fresh MEDIA join and handshake |
+| successful account change, registration, identify, or logout | retire the old account authority before mutation; failed or same-account authentication does not retire it |
+
+`E2EE-DETACH` is server-authored only. Clients cannot forge it. On receiving its
+own detach, a client zeroizes local group and pairwise key material and returns
+the call state to idle. A retired connection cannot continue sending old
+WebSocket frames even when another attachment has the same account and nick.
+
+### Mesh boundary
+
+Signed E2EE control events use the Event Spine and converge across the secured
+Undertow mesh. Binary WebSocket media forwarding is currently node-local. A
+call whose participants attach to different nodes receives converged presence,
+handshake, detach, and group-key signaling, but Onyx Server does not yet cascade
+the encrypted binary media frames between nodes. Cross-node binary media relay
+remains explicit follow-up work; it is not claimed by the v2 E2EE release.
+
 ## WebTransport and WASM shims
 
 `src/proto/webtransport.zig` is a pure framing module for QUIC varints, capsules, WebTransport datagrams, and stream signal prefixes. The daemon listener in `src/daemon/webtransport_listener.zig` turns the QUIC + HTTP/3 + WebTransport stack into a live UDP endpoint and bridges each WebTransport session to the daemon's ordinary IRC listener over a loopback TCP proxy. Evidence: `src/proto/webtransport.zig:4`, `src/proto/webtransport.zig:6`, `src/proto/webtransport.zig:24`, `src/proto/webtransport.zig:30`, `src/proto/webtransport.zig:174`, `src/proto/webtransport.zig:215`, `src/daemon/webtransport_listener.zig:4`, `src/daemon/webtransport_listener.zig:5`, `src/daemon/webtransport_listener.zig:7`.
