@@ -45,6 +45,7 @@ build graph and can accidentally run the broad suite.
 | `zig build test --summary all` | Full module + executable-root tests. |
 | `zig build fuzz --summary all` | Bounded replay of coverage-fuzz seed corpora. |
 | `zig build bogo-shim-test --summary all` | Self-driven BoGo shim parse/framing/subprocess smokes. |
+| `tools/bogo.sh` | Pinned external BoringSSL runner: exact 24-pass/3-explicit-skip baseline; fails on drift, any unexpected failure, or an all-skip/vacuous result. Uses `.bogo/` or `BOGO_CACHE_DIR`, never `/tmp`. |
 | `zig build all-checks --summary all` | Deterministic pre-push gate: `check`, WASM build, full tests, bounded fuzz, and BoGo shim self-tests. |
 | `zig build all-checks-verbose --summary all` | Same gate, with per-test progress for the full suite. |
 

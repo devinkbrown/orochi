@@ -14,10 +14,14 @@ run is the one from source.
 | `zig build package --prefix <dir>` | staged `bin/onyx-server` + reference config + systemd unit | Production install from a built tree |
 | `packaging/release.sh` | `dist/onyx-server-<version>-x86_64-linux-musl` + `SHA256SUMS` + SBOM + provenance | Reproducible attested static binary |
 
-There is **no published GitHub Release / registry image yet**. Until a verified
-prebuilt is cut and published, every external self-host path still **builds from
-source** (minutes on a fresh clone, not wall-clock "seconds"). Do not claim a
-timed install until someone stopwatches download→chat against a real artifact.
+The first verified prebuilt is the public
+[`v0.5.6` GitHub Release](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6).
+It includes the static musl binary, quickstart config, checksum manifest,
+CycloneDX SBOM, and provenance statement. The manifest is reproducible and was
+download-smoked through IRC and WebSocket before publication. It is **not yet
+cryptographically signed**, so verify the checksum and provenance and use the
+source rebuild path below when your threat model requires independent trust.
+There is still no published registry image; Docker remains build-from-source.
 
 The daemon binary is always **`onyx-server`**. The release script only prefixes a
 version and target on the *artifact filename*
@@ -41,12 +45,17 @@ risking a silent fall-through to the built-in DEFAULT identity.
 ## Quickstart (native)
 
 ```sh
-# 1. Build the binary (a few minutes on a fresh clone — there is no prebuilt
-#    download yet; see "Honest release path" above).
-packaging/release.sh
-# 2. Preflight, then run a single self-hosted node with the zero-config quickstart:
-./dist/onyx-server-*-x86_64-linux-musl --check-config packaging/onyx-server.quickstart.toml
-./dist/onyx-server-*-x86_64-linux-musl packaging/onyx-server.quickstart.toml
+# 1. Download the published static binary, quickstart, and checksum manifest.
+release=https://github.com/devinkbrown/onyx-server/releases/download/v0.5.6
+curl -fLO "$release/onyx-server-0.5.6-x86_64-linux-musl"
+curl -fLO "$release/onyx-server.quickstart.toml"
+curl -fLO "$release/SHA256SUMS"
+
+# 2. Verify the downloaded binary, make it executable, preflight, and run.
+grep ' onyx-server-0.5.6-x86_64-linux-musl$' SHA256SUMS | sha256sum -c -
+chmod +x onyx-server-0.5.6-x86_64-linux-musl
+./onyx-server-0.5.6-x86_64-linux-musl --check-config onyx-server.quickstart.toml
+./onyx-server-0.5.6-x86_64-linux-musl onyx-server.quickstart.toml
 ```
 
 Once the process is running, the daemon itself is up quickly (typically well
@@ -219,10 +228,11 @@ equivalent of SLSA L2. Running the identical steps on a hosted runner (e.g. the
 elevates this to *true* SLSA L2/L3; the field shapes here are drop-in compatible
 with that upgrade.
 
-## A10 — First public GitHub Release (human-gated)
+## A10 — First public GitHub Release (completed 2026-07-20)
 
-Agents may prepare artifacts; **only a human publishes**. Do not let fleet
-copy claim a download URL until this checklist is green.
+The human-authorized release is public at
+[`v0.5.6`](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6).
+The executed gate was:
 
 1. Clean tree on the release commit: `git status` empty (else `release.sh` refuses).
 2. `packaging/release.sh` → `dist/onyx-server-<ver>-x86_64-linux-musl` + `SHA256SUMS` + SBOM + provenance.
@@ -235,4 +245,6 @@ copy claim a download URL until this checklist is green.
 6. Smoke: download on a clean machine → `./onyx-server --check-config …` → chat on 8080.
 7. Only then update landing self-host CTAs from "build from source" to "download the release".
 
-Until step 6, landing and packaging docs stay on **build-from-source honesty**.
+All seven steps passed. The release remains deliberately labeled unsigned until
+a cosign identity is configured; checksum, SBOM, provenance, reproducibility,
+and download smoke are current evidence, not a substitute for a signature.

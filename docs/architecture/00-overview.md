@@ -47,6 +47,7 @@ the operational lanes used to keep the daemon deployable:
 | `test-mesh` / `test-tls` / `test-server` / `test-ircx` | Focused subsystem suites for Undertow, Armor TLS, daemon integration, and IRCX behavior. |
 | `test-cli` | Tests for the standalone `armor` crypto toolkit (openssl-parity verbs over the Armor substrate). Evidence: `build.zig:478`. |
 | `all-checks` | Deterministic pre-push gate: check, WASM build, full tests, fuzz corpus replay, and BoGo shim self-tests. |
+| `tools/bogo.sh` / CI `bogo` | External pinned BoringSSL interoperability gate with exact non-vacuous pass/skip baseline enforcement. |
 | `release` | ReleaseFast stripped production binary. |
 | `package` | ReleaseFast daemon plus reference config and systemd unit staged into the install prefix. |
 

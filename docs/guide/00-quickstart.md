@@ -86,14 +86,16 @@ After the basic setup, define connection classes under `[class.<name>]` to contr
 
 ## Production next steps
 
-- Use `zig build package --prefix /tmp/onyx-server-stage` to stage a ReleaseFast
+- Use `zig build package --prefix ./.cache/onyx-server-stage` to stage a ReleaseFast
   **`onyx-server`** binary, reference config, and systemd unit (the unit includes
   `ExecStartPre=… --check-config …`).
 - For a public node: [Production TLS card](tls.md#production-tls-card) (DNS, ACME,
   `ws_plain = false`) — also summarized in [`packaging/README.md`](../../packaging/README.md).
-- There is no prebuilt GitHub Release yet; the honest self-host path is still
-  build-from-source (`packaging/release.sh` or `zig build package`). Do not market
-  wall-clock "60 second install" until a published artifact is stopwatched.
+- Download the verified static binary and quickstart from the public
+  [`v0.5.6` release](https://github.com/devinkbrown/onyx-server/releases/tag/v0.5.6),
+  or independently rebuild it with `packaging/release.sh`. The published path
+  passed checksum, reproducibility, config, IRC, and WebSocket download smoke;
+  it is currently unsigned, so do not imply signature-backed provenance.
 - Read the [runbook](../RUNBOOK.md) before deploying or hot-upgrading a live node.
 - Read [testing.md](testing.md) for the focused roadmap gates and long-run verbose
   assurance lanes.
