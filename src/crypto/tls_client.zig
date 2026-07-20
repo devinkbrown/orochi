@@ -8,7 +8,6 @@
 //! `encrypt()` / `decrypt()` once `handshakeDone()` is true.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const hkdf_tls13 = @import("hkdf_tls13.zig");
 const tls_resumption = @import("tls_resumption.zig");
@@ -25,6 +24,7 @@ const rsa_sign = @import("rsa_sign.zig");
 const sign = @import("sign.zig");
 const ecdh_p256 = @import("ecdh_p256.zig");
 const kx = @import("kx.zig");
+const random_mod = @import("random.zig");
 
 const tls_supported_versions = @import("../proto/tls_supported_versions.zig");
 const tls_keyshare = @import("../proto/tls_keyshare.zig");
@@ -2737,18 +2737,7 @@ fn isHelloRetryRequest(body: []const u8) bool {
 }
 
 fn osEntropy(buf: []u8) Error!void {
-    switch (builtin.os.tag) {
-        .linux => {
-            var filled: usize = 0;
-            while (filled < buf.len) {
-                const rc = std.os.linux.getrandom(buf.ptr + filled, buf.len - filled, 0);
-                const signed: isize = @bitCast(rc);
-                if (signed < 0 or rc == 0) return error.BadHandshake;
-                filled += rc;
-            }
-        },
-        else => return error.BadHandshake,
-    }
+    random_mod.fillOsEntropy(buf) catch return error.BadHandshake;
 }
 
 fn writePlainRecord(allocator: Allocator, typ: tls_record.ContentType, fragment: []const u8) Error![]u8 {
