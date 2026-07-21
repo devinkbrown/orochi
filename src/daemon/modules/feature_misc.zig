@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! feature.misc module — identity (VHOST/PRIVS), content FILTER, media surface,
-//! offline MEMO (legacy wire alias TEGAMI), and ACTIVITY presence. Thin thunks
-//! over existing LinuxServer handlers. See 17-module-system.md.
+//! offline MEMO, and ACTIVITY presence. Thin thunks over existing LinuxServer
+//! handlers. See 17-module-system.md.
 const registry = @import("../registry.zig");
 const Core = @import("../module_core.zig").Core;
 const I = registry.CommandInvocation;
@@ -58,9 +58,7 @@ pub const module = registry.Module{
         .{ .name = "PRIVS", .handler = privs },
         .{ .name = "FILTER", .handler = filter },
         .{ .name = "MEDIA", .feature = "media", .handler = media },
-        // MEMO is the preferred command; TEGAMI remains a dual-accepted wire alias.
         .{ .name = "MEMO", .handler = memoCmd },
-        .{ .name = "TEGAMI", .handler = memoCmd },
         .{ .name = "WEBPUSH", .handler = webpushCmd, .summary = "Browser push subscriptions (VAPID/SUBSCRIBE/UNSUBSCRIBE/LIST)" },
         .{ .name = "ACTIVITY", .handler = activity },
         .{ .name = "GEOIP", .min_params = 1, .access = .oper, .handler = geoipCmd, .summary = "GeoIP lookup of an IP (oper)" },

@@ -105,7 +105,7 @@ pub const FrameType = enum(u8) {
     /// Carries a bounded `memo_push_relay` record: {account, from, text preview}.
     /// The receiving node only runs its LOCAL Web Push worker/subscription store;
     /// no memo message or subscription state is replicated by this frame.
-    /// Numeric tag 0x1C is wire-stable (historical name TEGAMI_PUSH).
+    /// MEMO_PUSH tag 0x1C.
     MEMO_PUSH = 0x1C,
     /// Signed consume tombstone for a portable session migration. Peers remove
     /// staged copies and retain a token tombstone so delayed offers cannot fork.

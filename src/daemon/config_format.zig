@@ -1235,14 +1235,9 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
 
     // [bouncer]
     cfg.bouncer.memo_text_max_len = try uintField(doc, "bouncer.memo_text_max_len", cfg.bouncer.memo_text_max_len, 64, 2048);
-    // Legacy bouncer.tegami_* keys (one rename window).
-    cfg.bouncer.memo_text_max_len = try uintField(doc, "bouncer.tegami_text_max_len", cfg.bouncer.memo_text_max_len, 64, 2048);
     cfg.bouncer.memo_from_max_len = try uintField(doc, "bouncer.memo_from_max_len", cfg.bouncer.memo_from_max_len, 16, 128);
-    cfg.bouncer.memo_from_max_len = try uintField(doc, "bouncer.tegami_from_max_len", cfg.bouncer.memo_from_max_len, 16, 128);
     cfg.bouncer.memo_mailbox_depth = try uintField(doc, "bouncer.memo_mailbox_depth", cfg.bouncer.memo_mailbox_depth, 8, 1024);
-    cfg.bouncer.memo_mailbox_depth = try uintField(doc, "bouncer.tegami_mailbox_depth", cfg.bouncer.memo_mailbox_depth, 8, 1024);
     cfg.bouncer.memo_max_accounts = try uintField(doc, "bouncer.memo_max_accounts", cfg.bouncer.memo_max_accounts, 1024, 1048576);
-    cfg.bouncer.memo_max_accounts = try uintField(doc, "bouncer.tegami_max_accounts", cfg.bouncer.memo_max_accounts, 1024, 1048576);
 
     // [filter]
     cfg.filter.koshi_max_patterns = try uintField(doc, "filter.koshi_max_patterns", cfg.filter.koshi_max_patterns, 16, 4096);

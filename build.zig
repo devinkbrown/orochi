@@ -448,7 +448,7 @@ pub fn build(b: *std.Build) void {
         "TOTP",
         "WEBAUTHN",
         "SESSION",
-        "TEGAMI",
+        "MEMO",
         "SUCCESSOR",
         "account",
     };
@@ -457,7 +457,7 @@ pub fn build(b: *std.Build) void {
         .filters = services_test_filters,
     });
     const run_services_tests = b.addRunArtifact(services_tests);
-    const test_services_step = b.step("test-services", "Run focused services, account, SASL, TOTP, WebAuthn, session, and Tegami tests");
+    const test_services_step = b.step("test-services", "Run focused services, account, SASL, TOTP, WebAuthn, session, and MEMO tests");
     test_services_step.dependOn(&run_services_tests.step);
     const services_tests_verbose = b.addTest(.{
         .root_module = mod,
