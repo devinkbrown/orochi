@@ -4,6 +4,8 @@
 
 This reference documents the live capability registry in `src/daemon/dispatch.zig`. `src/proto/cap.zig` is not the live CAP registry. The live registry is `CapId` plus `cap_specs`. CAP LS emits those specs and appends `=<value>` for CAP LS 302 only when the spec or session supplies a value (`src/daemon/dispatch.zig:223`, `src/daemon/dispatch.zig:293`, `src/daemon/dispatch.zig:504`).
 
+For third-party client readiness (Halloy REQ set vs this table, SASL mechs, SESSION/CHATHISTORY/WEBPUSH/IRCX gaps), see [client-interop-halloy.md](../client-interop-halloy.md).
+
 ## CAP LS 302 table
 
 | Capability | CAP LS 302 Value | Notes | Evidence |

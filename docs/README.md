@@ -86,6 +86,7 @@ authoritative.
 - [Modes](reference/protocol/modes.md) — user and channel modes, status prefixes
 - [ISUPPORT (005)](reference/protocol/isupport.md)
 - [Capabilities (IRCv3)](reference/protocol/caps.md)
+- [Halloy capability matrix](reference/client-interop-halloy.md) — third-party interop (Halloy vs live CAP/ISUPPORT/commands)
 - [IRCv3](reference/ircv3.md) — capability and message-tag support
 - [IRCX](reference/ircx/README.md) — the IRCX protocol surface (PROP, ACCESS, EVENT, AUTH)
 - [Native media MAC](reference/native-media-mac.md) — the media authentication tag
