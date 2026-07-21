@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! WebTransport-over-QUIC datagram path over the Ryūsen transport seam.
+//! WebTransport-over-QUIC datagram path over the adaptive transport seam.
 //!
 //! Composes the shipped wire codecs into the unreliable datagram pipeline a
 //! browser (WebTransport) or native peer uses for media/control:
@@ -10,7 +10,7 @@
 //!     -> WebTransport session datagram (quarter-stream-id + payload)   [webtransport]
 //!     -> QUIC DATAGRAM frame                                            [quic_frame]
 //!     -> QUIC short-header packet (packet number)                       [quic_packet]
-//!     -> Ryūsen transport                                               [ryusen]
+//!     -> adaptive transport                                               [adaptive_transport]
 //!
 //! Header protection (quic_packet.apply/removeHeaderProtection) and AEAD packet
 //! encryption are demonstrated/derived from the QUIC key schedule (quic_tls)
@@ -18,7 +18,7 @@
 //! the secure variant wraps. Transport-agnostic + deterministic for DST.
 const std = @import("std");
 
-const ryusen = @import("../substrate/ryusen.zig");
+const adaptive_transport = @import("../substrate/adaptive_transport.zig");
 const quic_packet = @import("quic_packet.zig");
 const quic_frame = @import("quic_frame.zig");
 const webtransport = @import("webtransport.zig");
@@ -28,14 +28,14 @@ pub const ConnectionId = quic_packet.ConnectionId;
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
-    transport: ryusen.Transport,
+    transport: adaptive_transport.Transport,
     session_id: SessionId,
     dcid: ConnectionId,
     next_pn: u32 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
-        transport: ryusen.Transport,
+        transport: adaptive_transport.Transport,
         session_id: SessionId,
         dcid: ConnectionId,
     ) Session {
@@ -71,7 +71,7 @@ pub const Session = struct {
     /// returned payload is a freshly-allocated owned copy.
     pub fn recv(self: *Session, buffer: []u8) !?[]u8 {
         try self.transport.supplyReceiveBuffer(buffer);
-        var comps: [4]ryusen.ReceiveCompletion = undefined;
+        var comps: [4]adaptive_transport.ReceiveCompletion = undefined;
         const n = try self.transport.pollReceiveCompletions(&comps);
         if (n == 0) return null;
         return self.parsePacket(comps[0].bytes());
@@ -110,7 +110,7 @@ fn cid8() !ConnectionId {
 
 test "WebTransport datagram round-trips over QUIC packets on a loopback" {
     const allocator = testing.allocator;
-    var pairs = try ryusen.LoopbackTransport.pair(allocator, .{});
+    var pairs = try adaptive_transport.LoopbackTransport.pair(allocator, .{});
     defer pairs.deinit();
 
     const sid = try SessionId.initClientBidirectional(0);
@@ -139,7 +139,7 @@ test "WebTransport datagram round-trips over QUIC packets on a loopback" {
 
 test "parsePacket recovers the WT session id and payload" {
     const allocator = testing.allocator;
-    var pairs = try ryusen.LoopbackTransport.pair(allocator, .{});
+    var pairs = try adaptive_transport.LoopbackTransport.pair(allocator, .{});
     defer pairs.deinit();
     const sid = try SessionId.initClientBidirectional(4);
     const dcid = try cid8();

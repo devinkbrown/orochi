@@ -301,7 +301,7 @@ pub const Worker = struct {
     }
 
     /// Enqueue a push (copies everything). Full queue = dropped: push is a
-    /// best-effort nudge, never a delivery guarantee (tegami holds the DM).
+    /// best-effort nudge, never a delivery guarantee (memo holds the DM).
     pub fn enqueue(
         self: *Worker,
         endpoint: []const u8,

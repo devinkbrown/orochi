@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! feature.misc module — identity (VHOST/PRIVS), content FILTER, media surface,
-//! offline TEGAMI, and ACTIVITY presence. Thin thunks over existing LinuxServer
-//! handlers. See 17-module-system.md.
+//! offline MEMO (legacy wire alias TEGAMI), and ACTIVITY presence. Thin thunks
+//! over existing LinuxServer handlers. See 17-module-system.md.
 const registry = @import("../registry.zig");
 const Core = @import("../module_core.zig").Core;
 const I = registry.CommandInvocation;
@@ -24,9 +24,9 @@ fn media(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
     try x.server.handleMedia(x.id, x.conn, x.parsed);
 }
-fn tegami(c: *anyopaque, _: I) anyerror!void {
+fn memoCmd(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
-    try x.server.handleTegami(x.conn, x.parsed);
+    try x.server.handleMemo(x.conn, x.parsed);
 }
 fn webpushCmd(c: *anyopaque, _: I) anyerror!void {
     const x = Core.from(c);
@@ -58,9 +58,10 @@ pub const module = registry.Module{
         .{ .name = "PRIVS", .handler = privs },
         .{ .name = "FILTER", .handler = filter },
         .{ .name = "MEDIA", .feature = "media", .handler = media },
-        .{ .name = "TEGAMI", .handler = tegami },
+        // MEMO is the preferred command; TEGAMI remains a dual-accepted wire alias.
+        .{ .name = "MEMO", .handler = memoCmd },
+        .{ .name = "TEGAMI", .handler = memoCmd },
         .{ .name = "WEBPUSH", .handler = webpushCmd, .summary = "Browser push subscriptions (VAPID/SUBSCRIBE/UNSUBSCRIBE/LIST)" },
-        .{ .name = "MEMO", .handler = tegami }, // alias: TEGAMI (手紙) is the memo system
         .{ .name = "ACTIVITY", .handler = activity },
         .{ .name = "GEOIP", .min_params = 1, .access = .oper, .handler = geoipCmd, .summary = "GeoIP lookup of an IP (oper)" },
         .{ .name = "SUMMON", .min_params = 2, .access = .oper, .handler = summon },

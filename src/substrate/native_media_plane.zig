@@ -13,7 +13,7 @@
 //! layer than it asked for.
 //!
 //! Transport-neutral: it commits to no socket. The live daemon drives it over
-//! whatever native datagram transport (ryusen/CoilPack) carries the frames — the
+//! whatever native datagram transport (adaptive_transport/CoilPack) carries the frames — the
 //! plane only makes the forwarding decision.
 const std = @import("std");
 const media = @import("undertow/media.zig");

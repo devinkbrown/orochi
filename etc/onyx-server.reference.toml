@@ -324,8 +324,8 @@ view_passive_capacity = 64
 view_shuffle_active = 2
 view_shuffle_passive = 4
 
-[mesh.sazanami]
-# Sazanami witnessed failure detection: gossip-side suspect reaping and the
+[mesh.ripple]
+# Ripple witnessed failure detection: gossip-side suspect reaping and the
 # witness quorum required before a peer is declared dead.
 suspicion_timeout_ms = 3000
 # Minimum 2 — a single accuser must never bury a peer.
@@ -545,10 +545,10 @@ password_max_len = 512  # new password maximum length (64..4096)
 
 # --- [bouncer] — per-account bouncer/offline-message limits ------------------
 [bouncer]
-tegami_text_max_len = 400       # offline DM body bytes (64..2048)
-tegami_from_max_len = 64        # stored sender-label bytes (16..128)
-tegami_mailbox_depth = 64       # offline messages per account (8..1024)
-tegami_max_accounts = 65536     # accounts with offline mailboxes (1024..1048576)
+memo_text_max_len = 400       # offline DM body bytes (64..2048)
+memo_from_max_len = 64        # stored sender-label bytes (16..128)
+memo_mailbox_depth = 64       # offline messages per account (8..1024)
+memo_max_accounts = 65536     # accounts with offline mailboxes (1024..1048576)
 
 
 # --- [filter] — oper-managed Koshi moderation filter sizing ------------------

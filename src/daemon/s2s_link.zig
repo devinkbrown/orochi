@@ -819,17 +819,17 @@ pub const S2sLink = struct {
         return self.peer.takeWards();
     }
 
-    /// Emit a signed, signing-required Web Push hint for an offline Tegami/DM.
+    /// Emit a signed, signing-required Web Push hint for an offline memo/DM.
     /// The peer driver no-ops for non-signing peers so this never rides legacy
     /// plaintext S2S.
-    pub fn sendTegamiPush(self: *S2sLink, account: []const u8, from: []const u8, text: []const u8) !void {
-        try self.peer.sendTegamiPush(self.sink(), account, from, text);
+    pub fn sendMemoPush(self: *S2sLink, account: []const u8, from: []const u8, text: []const u8) !void {
+        try self.peer.sendMemoPush(self.sink(), account, from, text);
     }
 
-    /// Drain queued TEGAMI_PUSH payloads from this peer (caller owns + frees each
-    /// slice and the outer slice; decode with `tegami_push_relay.decode`).
-    pub fn takeTegamiPushes(self: *S2sLink) ![][]u8 {
-        return self.peer.takeTegamiPushes();
+    /// Drain queued MEMO_PUSH payloads from this peer (caller owns + frees each
+    /// slice and the outer slice; decode with `memo_push_relay.decode`).
+    pub fn takeMemoPushes(self: *S2sLink) ![][]u8 {
+        return self.peer.takeMemoPushes();
     }
 
     /// Copy this peer's known-server topology into `out` for partition analysis.

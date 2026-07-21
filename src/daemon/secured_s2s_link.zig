@@ -1084,19 +1084,19 @@ pub const SecuredLink = struct {
         return link.takeWards();
     }
 
-    /// Emit a signed Web Push hint for an offline Tegami/DM over the encrypted
+    /// Emit a signed Web Push hint for an offline memo/DM over the encrypted
     /// S2S leg. The inner peer requires frame signing, so old/non-signing peers
     /// silently get no hint.
-    pub fn sendTegamiPush(self: *SecuredLink, account: []const u8, from: []const u8, text: []const u8) anyerror!void {
+    pub fn sendMemoPush(self: *SecuredLink, account: []const u8, from: []const u8, text: []const u8) anyerror!void {
         const link = self.inner orelse return;
-        try link.sendTegamiPush(account, from, text);
+        try link.sendMemoPush(account, from, text);
         try self.drainInner();
     }
 
-    /// Drain queued TEGAMI_PUSH payloads decoded by the inner link.
-    pub fn takeTegamiPushes(self: *SecuredLink) anyerror![][]u8 {
+    /// Drain queued MEMO_PUSH payloads decoded by the inner link.
+    pub fn takeMemoPushes(self: *SecuredLink) anyerror![][]u8 {
         const link = self.inner orelse return &.{};
-        return link.takeTegamiPushes();
+        return link.takeMemoPushes();
     }
 
     /// Copy this peer's known-server topology into `out` for partition analysis

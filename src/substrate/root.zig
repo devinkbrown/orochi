@@ -104,7 +104,7 @@ pub const roaring = @import("roaring.zig");
 pub const robin_hood = @import("robin_hood.zig");
 pub const rtp_nack = @import("rtp_nack.zig");
 pub const rwlock = @import("rwlock.zig");
-pub const ryusen = @import("ryusen.zig");
+pub const adaptive_transport = @import("adaptive_transport.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const segment_tree = @import("segment_tree.zig");
 pub const seq_crdt = @import("seq_crdt.zig");
@@ -246,7 +246,7 @@ test {
     _ = robin_hood;
     _ = rtp_nack;
     _ = rwlock;
-    _ = ryusen;
+    _ = adaptive_transport;
     _ = scheduler;
     _ = segment_tree;
     _ = seq_crdt;

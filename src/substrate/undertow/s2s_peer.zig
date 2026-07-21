@@ -281,7 +281,7 @@ const membership_event = @import("../../proto/membership_event.zig");
 const oper_event = @import("../../proto/oper_event.zig");
 const observe_event = @import("../../proto/observe_event.zig");
 const kill_relay = @import("../../proto/kill_relay.zig");
-const tegami_push_relay = @import("../../proto/tegami_push_relay.zig");
+const memo_push_relay = @import("../../proto/memo_push_relay.zig");
 const channel_mode_flags_event = @import("../../proto/channel_mode_flags_event.zig");
 const channel_list_event = @import("../../proto/channel_list_event.zig");
 const channel_mode_state_event = @import("../../proto/channel_mode_state_event.zig");
@@ -679,10 +679,10 @@ pub const S2sPeer = struct {
     /// decode + apply (add/remove) into its local Warden store. Substrate-pure:
     /// never decoded here.
     wards: std.ArrayListUnmanaged([]u8) = .empty,
-    /// Verified TEGAMI_PUSH payloads received from this peer, awaiting the daemon
+    /// Verified MEMO_PUSH payloads received from this peer, awaiting the daemon
     /// to decode and run local Web Push delivery. These are signing-required:
     /// legacy/plaintext peers are ignored so DM previews do not ride unsigned S2S.
-    tegami_pushes: std.ArrayListUnmanaged([]u8) = .empty,
+    memo_pushes: std.ArrayListUnmanaged([]u8) = .empty,
     seen: message_relay.SeenSet,
     /// Per-link reflection cache only; not authoritative replay protection.
     seen_v2: message_relay_v2.SeenSet,
@@ -949,8 +949,8 @@ pub const S2sPeer = struct {
         self.kills.deinit(self.allocator);
         for (self.wards.items) |m| self.allocator.free(m);
         self.wards.deinit(self.allocator);
-        for (self.tegami_pushes.items) |m| self.allocator.free(m);
-        self.tegami_pushes.deinit(self.allocator);
+        for (self.memo_pushes.items) |m| self.allocator.free(m);
+        self.memo_pushes.deinit(self.allocator);
         self.seen.deinit();
         self.seen_v2.deinit();
         self.seen_oper_event_v2.deinit();
@@ -1221,7 +1221,7 @@ pub const S2sPeer = struct {
             .REPAIR_SUMMARY => try self.recvRepairSummary(frame.payload, sink),
             .REPAIR_REQUEST => try self.recvRepairRequest(frame.payload, sink),
             .REPAIR_RESPONSE => try self.recvRepairResponse(frame.payload),
-            .TEGAMI_PUSH => try self.recvTegamiPush(frame.payload),
+            .MEMO_PUSH => try self.recvMemoPush(frame.payload),
         }
     }
 
@@ -1776,32 +1776,32 @@ pub const S2sPeer = struct {
         try self.emitSignable(sink, .WARD, wire);
     }
 
-    /// Queue a verified inbound TEGAMI_PUSH hint for daemon-side Web Push
+    /// Queue a verified inbound MEMO_PUSH hint for daemon-side Web Push
     /// delivery. Unlike older direct-owned frames, this is signing-required:
     /// peers that did not negotiate frame signing are ignored, because the payload
     /// carries a DM preview and should only ride the secured node-identity path.
-    fn recvTegamiPush(self: *S2sPeer, frame_payload: []const u8) !void {
+    fn recvMemoPush(self: *S2sPeer, frame_payload: []const u8) !void {
         if (!self.peer_supports_signing) return;
-        const payload = self.verifiedPayload(.TEGAMI_PUSH, frame_payload) orelse return;
-        _ = tegami_push_relay.decode(payload) catch return;
+        const payload = self.verifiedPayload(.MEMO_PUSH, frame_payload) orelse return;
+        _ = memo_push_relay.decode(payload) catch return;
         const owned = self.allocator.dupe(u8, payload) catch return;
-        self.tegami_pushes.append(self.allocator, owned) catch self.allocator.free(owned);
+        self.memo_pushes.append(self.allocator, owned) catch self.allocator.free(owned);
     }
 
-    /// Drain queued TEGAMI_PUSH payloads (caller owns + frees each slice and the
-    /// outer slice). Each decodes with `tegami_push_relay.decode`.
-    pub fn takeTegamiPushes(self: *S2sPeer) ![][]u8 {
-        return self.tegami_pushes.toOwnedSlice(self.allocator);
+    /// Drain queued MEMO_PUSH payloads (caller owns + frees each slice and the
+    /// outer slice). Each decodes with `memo_push_relay.decode`.
+    pub fn takeMemoPushes(self: *S2sPeer) ![][]u8 {
+        return self.memo_pushes.toOwnedSlice(self.allocator);
     }
 
-    /// Emit a signed TEGAMI_PUSH hint to this peer. No-op unless the peer
+    /// Emit a signed MEMO_PUSH hint to this peer. No-op unless the peer
     /// negotiated frame signing and this node has a signing key; this avoids
     /// leaking DM previews onto legacy/plaintext S2S links.
-    pub fn sendTegamiPush(self: *S2sPeer, sink: ByteSink, account: []const u8, from: []const u8, text: []const u8) !void {
+    pub fn sendMemoPush(self: *S2sPeer, sink: ByteSink, account: []const u8, from: []const u8, text: []const u8) !void {
         if (!self.peer_supports_signing or self.signing_key == null) return;
-        var buf: [tegami_push_relay.max_encoded_len]u8 = undefined;
-        const wire = try tegami_push_relay.encode(.{ .account = account, .from = from, .text = text }, &buf);
-        try self.emitSignable(sink, .TEGAMI_PUSH, wire);
+        var buf: [memo_push_relay.max_encoded_len]u8 = undefined;
+        const wire = try memo_push_relay.encode(.{ .account = account, .from = from, .text = text }, &buf);
+        try self.emitSignable(sink, .MEMO_PUSH, wire);
     }
 
     /// Emit a signed OBSERVE_EVENT to this peer (network-wide OBSERVE fan-out).
@@ -4292,8 +4292,8 @@ test "identity transition queue preserves mixed order and legacy drains discard 
     const ident = MemberIdentity{ .username = "device", .realname = "Device B", .host = "mesh.test" };
 
     try peer.queueMembershipValues("#old", "DeviceB", ident.username, ident.realname, ident.host, "", "", .parted, 0, 0);
-    try peer.queueForcedNickRename("DeviceB", "Ruri", ident);
-    try peer.queueMembershipValues("#new", "Ruri", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
+    try peer.queueForcedNickRename("DeviceB", "Nova", ident);
+    try peer.queueMembershipValues("#new", "Nova", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
 
     var first = peer.takeNextIdentityTransition() orelse return error.TestUnexpectedResult;
     switch (first) {
@@ -4308,7 +4308,7 @@ test "identity transition queue preserves mixed order and legacy drains discard 
     switch (second) {
         .nick => |*change| {
             try std.testing.expectEqualStrings("DeviceB", change.old_nick);
-            try std.testing.expectEqualStrings("Ruri", change.new_nick);
+            try std.testing.expectEqualStrings("Nova", change.new_nick);
             change.deinit(allocator);
         },
         .membership => return error.TestUnexpectedResult,
@@ -4328,8 +4328,8 @@ test "identity transition queue preserves mixed order and legacy drains discard 
     // only membership markers, leaving the intervening NICK as the next mixed
     // transition instead of stranding stale markers behind empty typed queues.
     try peer.queueMembershipValues("#old", "DeviceB", ident.username, ident.realname, ident.host, "", "", .parted, 0, 0);
-    try peer.queueForcedNickRename("DeviceB", "Ruri", ident);
-    try peer.queueMembershipValues("#new", "Ruri", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
+    try peer.queueForcedNickRename("DeviceB", "Nova", ident);
+    try peer.queueMembershipValues("#new", "Nova", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
     const memberships = try peer.takeMembershipChanges();
     defer allocator.free(memberships);
     try std.testing.expectEqual(@as(usize, 2), memberships.len);
@@ -4342,8 +4342,8 @@ test "identity transition queue preserves mixed order and legacy drains discard 
     try std.testing.expect(peer.takeNextIdentityTransition() == null);
 
     try peer.queueMembershipValues("#old", "DeviceB", ident.username, ident.realname, ident.host, "", "", .parted, 0, 0);
-    try peer.queueForcedNickRename("DeviceB", "Ruri", ident);
-    try peer.queueMembershipValues("#new", "Ruri", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
+    try peer.queueForcedNickRename("DeviceB", "Nova", ident);
+    try peer.queueMembershipValues("#new", "Nova", ident.username, ident.realname, ident.host, "", "", .joined, 0, 0);
     const nicks = try peer.takeNickChanges();
     defer allocator.free(nicks);
     try std.testing.expectEqual(@as(usize, 1), nicks.len);
@@ -6969,11 +6969,11 @@ test "rejected downgraded MEMBERSHIP creates no UID route delta or roster entry"
     var reject_stub = RejectVerifierStub{};
     b.setResidenceVerifier(reject_stub.verifier());
 
-    try a.sendMembership(a_to_b.sink(), "#room", "Ruri", 0, 200, true, .{
+    try a.sendMembership(a_to_b.sink(), "#room", "Nova", 0, 200, true, .{
         .username = "u",
         .realname = "r",
         .host = "h",
-        .account = "ruri-acct",
+        .account = "nova-acct",
     }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x73F);
 
@@ -7015,11 +7015,11 @@ test "negotiated-v2 rowless untrusted MEMBERSHIP keeps its route delta and roste
     // No local token owner exists, so the daemon's exact Store verifier returns
     // untrusted. On a negotiated-v2 link that is a compatibility sidecar, not a
     // downgrade rejection: routing/NAMES still need this remote participant.
-    try a.sendMembership(a_to_b.sink(), "#room", "Ruri", 0, 200, true, .{
+    try a.sendMembership(a_to_b.sink(), "#room", "Nova", 0, 200, true, .{
         .username = "u",
         .realname = "r",
         .host = "h",
-        .account = "ruri-acct",
+        .account = "nova-acct",
     }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x75F);
     b.processDeferredResidenceFrames(tc.now_ms);
@@ -7030,10 +7030,10 @@ test "negotiated-v2 rowless untrusted MEMBERSHIP keeps its route delta and roste
         allocator.free(changes);
     }
     try std.testing.expectEqual(@as(usize, 1), changes.len);
-    try std.testing.expectEqualStrings("Ruri", changes[0].nick);
+    try std.testing.expectEqualStrings("Nova", changes[0].nick);
     const members = b.channelMembers("#room");
     try std.testing.expectEqual(@as(usize, 1), members.len);
-    try std.testing.expectEqualStrings("Ruri", members[0].nick);
+    try std.testing.expectEqualStrings("Nova", members[0].nick);
 }
 
 test "v2 residence barrier applies OFFER-visible trust before wire-ordered NICK and MEMBERSHIP" {
@@ -7063,34 +7063,34 @@ test "v2 residence barrier applies OFFER-visible trust before wire-ordered NICK 
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x770);
     try std.testing.expect(b.supportsSessionReplicaV2());
 
-    // The pre-resume nick is route-only. Ruri is held locally by the exact
+    // The pre-resume nick is route-only. Nova is held locally by the exact
     // logical session, but its new-origin Store authority becomes visible only
     // after feed returns (modelled by toggling this verifier before processing).
     _ = try b.routes.applyMembership("#presence", "DeviceB", a_short, 0, 100, true, .{
-        .account = "ruri-acct",
+        .account = "nova-acct",
     }, 10);
-    var local = ReclaimResolverStub{ .held_nick = "Ruri", .acct = "ruri-acct", .hlc = 0 };
+    var local = ReclaimResolverStub{ .held_nick = "Nova", .acct = "nova-acct", .hlc = 0 };
     b.setLocalNickResolver(local.resolver());
-    var trust = MutableTrustVerifierStub{ .account = "ruri-acct", .origin_node = a_short };
+    var trust = MutableTrustVerifierStub{ .account = "nova-acct", .origin_node = a_short };
     b.setResidenceVerifier(trust.verifier());
     var nick_authority = SessionTokenNickAuthorizerStub{
         .origin_node = a_short,
         .token = @splat(0x77),
-        .best_nick = "Ruri",
+        .best_nick = "Nova",
     };
     b.setSessionTokenNickAuthorizer(nick_authority.authorizer());
 
-    try a.sendNickChange(a_to_b.sink(), "DeviceB", "Ruri", .{
+    try a.sendNickChange(a_to_b.sink(), "DeviceB", "Nova", .{
         .username = "u",
         .realname = "r",
         .host = "h",
-        .account = "ruri-acct",
+        .account = "nova-acct",
     }, 200);
-    try a.sendMembership(a_to_b.sink(), "#room", "Ruri", 0, 201, true, .{
+    try a.sendMembership(a_to_b.sink(), "#room", "Nova", 0, 201, true, .{
         .username = "u",
         .realname = "r",
         .host = "h",
-        .account = "ruri-acct",
+        .account = "nova-acct",
     }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x771);
 
@@ -7100,7 +7100,7 @@ test "v2 residence barrier applies OFFER-visible trust before wire-ordered NICK 
     try std.testing.expectEqualStrings("DeviceB", b.channelMembers("#presence")[0].nick);
 
     // The daemon applies the earlier signed OFFER before releasing this queue.
-    // Both sidecars then see trusted exact-origin authority and retain Ruri;
+    // Both sidecars then see trusted exact-origin authority and retain Nova;
     // processing pre-authority would have minted a collision UID here.
     trust.trusted = true;
     b.processDeferredResidenceFrames(tc.now_ms);
@@ -7112,7 +7112,7 @@ test "v2 residence barrier applies OFFER-visible trust before wire-ordered NICK 
     }
     try std.testing.expectEqual(@as(usize, 1), nicks.len);
     try std.testing.expectEqualStrings("DeviceB", nicks[0].old_nick);
-    try std.testing.expectEqualStrings("Ruri", nicks[0].new_nick);
+    try std.testing.expectEqualStrings("Nova", nicks[0].new_nick);
     try std.testing.expectEqual(@as(usize, 1), nick_authority.calls);
     const changes = try b.takeMembershipChanges();
     defer {
@@ -7120,8 +7120,8 @@ test "v2 residence barrier applies OFFER-visible trust before wire-ordered NICK 
         allocator.free(changes);
     }
     try std.testing.expectEqual(@as(usize, 1), changes.len);
-    try std.testing.expectEqualStrings("Ruri", changes[0].nick);
-    try std.testing.expectEqualStrings("Ruri", b.channelMembers("#room")[0].nick);
+    try std.testing.expectEqualStrings("Nova", changes[0].nick);
+    try std.testing.expectEqualStrings("Nova", b.channelMembers("#room")[0].nick);
 }
 
 test "v2 residence barrier overflow discards the correlated sidecar batch" {
@@ -7151,8 +7151,8 @@ test "v2 residence barrier overflow discards the correlated sidecar batch" {
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x790);
     b.config.max_session_replica_frames = 1;
 
-    try a.sendMembership(a_to_b.sink(), "#one", "Ruri", 0, 300, true, .{ .account = "ruri-acct" }, "");
-    try a.sendMembership(a_to_b.sink(), "#two", "Ruri", 0, 301, true, .{ .account = "ruri-acct" }, "");
+    try a.sendMembership(a_to_b.sink(), "#one", "Nova", 0, 300, true, .{ .account = "nova-acct" }, "");
+    try a.sendMembership(a_to_b.sink(), "#two", "Nova", 0, 301, true, .{ .account = "nova-acct" }, "");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x791);
     try std.testing.expectEqual(@as(u64, 1), b.takeDroppedSessionReplicaFrames());
     try std.testing.expectEqual(@as(usize, 1), b.deferred_residence_frames.items.len);
@@ -7536,7 +7536,7 @@ test "signing peers round-trip a signed WARD frame" {
     try std.testing.expectEqual(@as(u64, 0), b.takeRejectedOriginFrames());
 }
 
-test "signing peers round-trip a signed TEGAMI_PUSH frame" {
+test "signing peers round-trip a signed MEMO_PUSH frame" {
     const allocator = std.testing.allocator;
     var tc = TestClock{ .now_ms = 10 };
     var a_state = ChannelCrdt.init(allocator, 1);
@@ -7562,16 +7562,16 @@ test "signing peers round-trip a signed TEGAMI_PUSH frame" {
     try b.startHandshake(b_to_a.sink());
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6EE);
 
-    try a.sendTegamiPush(a_to_b.sink(), "alice", "bob", "offline dm preview");
+    try a.sendMemoPush(a_to_b.sink(), "alice", "bob", "offline dm preview");
     try pump(&a, &b, &a_to_b, &b_to_a, tc.now_ms, 0x6EF);
 
-    const pushes = try b.takeTegamiPushes();
+    const pushes = try b.takeMemoPushes();
     defer {
         for (pushes) |p| allocator.free(p);
         allocator.free(pushes);
     }
     try std.testing.expectEqual(@as(usize, 1), pushes.len);
-    const ev = try tegami_push_relay.decode(pushes[0]);
+    const ev = try memo_push_relay.decode(pushes[0]);
     try std.testing.expectEqualStrings("alice", ev.account);
     try std.testing.expectEqualStrings("bob", ev.from);
     try std.testing.expectEqualStrings("offline dm preview", ev.text);
@@ -8089,7 +8089,7 @@ test "exploit: s2s frame dispatch survives hostile payloads for every frame type
         .CHANNEL_MODE_FLAGS,  .CHANNEL_LIST,           .CHANNEL_PROP,             .TOPIC,                            .NICKCHANGE,
         .CHANNEL_MODE_STATE,  .SESSION_MIGRATE,        .SESSION_MIGRATE_CONSUMED, .ENTITY_PROP,                      .CLONE_COUNT,
         .OPER_EVENT,          .OBSERVE_EVENT,          .KILL,                     .WARD,                             .RESYNC,
-        .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .TEGAMI_PUSH,                      .SESSION_REPLICA_OFFER,
+        .REPAIR_SUMMARY,      .REPAIR_REQUEST,         .REPAIR_RESPONSE,          .MEMO_PUSH,                      .SESSION_REPLICA_OFFER,
         .SESSION_REPLICA_ACK, .SESSION_REPLICA_REVOKE, .MESSAGE_V2,               .SESSION_REPLICA_ATTACHMENT_LEASE, .OPER_EVENT_V2,
         .MESSAGE_V2_ACK,
     };

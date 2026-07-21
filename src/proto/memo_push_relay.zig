@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Bounded S2S hint that asks a peer to run its local Web Push worker for an
-//! account-scoped offline Tegami/DM notification. It intentionally carries only
+//! account-scoped offline Memo/DM notification. It intentionally carries only
 //! the push preview data, never browser push subscriptions or VAPID material.
 const std = @import("std");
 
@@ -13,13 +13,13 @@ pub const max_encoded_len: usize = 1 + 1 + 2 + max_account_len + max_from_len + 
 
 pub const Error = error{ InvalidField, BufferTooSmall, Malformed };
 
-pub const TegamiPush = struct {
+pub const MemoPush = struct {
     account: []const u8,
     from: []const u8,
     text: []const u8,
 };
 
-pub fn encode(ev: TegamiPush, out: []u8) Error![]const u8 {
+pub fn encode(ev: MemoPush, out: []u8) Error![]const u8 {
     if (ev.account.len == 0 or ev.account.len > max_account_len) return error.InvalidField;
     if (ev.from.len == 0 or ev.from.len > max_from_len) return error.InvalidField;
     if (ev.text.len == 0) return error.InvalidField;
@@ -40,7 +40,7 @@ pub fn encode(ev: TegamiPush, out: []u8) Error![]const u8 {
     return out[0..total];
 }
 
-pub fn decode(bytes: []const u8) Error!TegamiPush {
+pub fn decode(bytes: []const u8) Error!MemoPush {
     if (bytes.len < 4) return error.Malformed;
     const account_len: usize = bytes[0];
     const from_len: usize = bytes[1];
@@ -60,7 +60,7 @@ pub fn decode(bytes: []const u8) Error!TegamiPush {
     return .{ .account = account, .from = from, .text = text };
 }
 
-test "tegami push relay encode decode round-trip" {
+test "memo push relay encode decode round-trip" {
     var buf: [max_encoded_len]u8 = undefined;
     const wire = try encode(.{ .account = "alice", .from = "bob", .text = "hello" }, &buf);
     const got = try decode(wire);
@@ -69,7 +69,7 @@ test "tegami push relay encode decode round-trip" {
     try std.testing.expectEqualStrings("hello", got.text);
 }
 
-test "tegami push relay truncates text preview and rejects malformed input" {
+test "memo push relay truncates text preview and rejects malformed input" {
     const long_text = &@as([max_text_len + 16]u8, @splat('x'));
     var buf: [max_encoded_len]u8 = undefined;
     const wire = try encode(.{ .account = "alice", .from = "bob", .text = long_text }, &buf);

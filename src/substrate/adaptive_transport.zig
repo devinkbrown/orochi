@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Ryusen: reactor-independent adaptive transport seam.
+//! Adaptive transport: reactor-independent adaptive transport seam.
 //!
 //! This module defines only the transport contract and a deterministic
 //! in-memory loopback backend. It performs no OS calls and imports no Onyx Server
@@ -67,7 +67,7 @@ pub const SelectError = error{
 
 /// Select the best compatible feature set from available capabilities.
 ///
-/// With no mutually-exclusive features in Ryusen's initial bitset, "best"
+/// With no mutually-exclusive features in adaptive transport's initial bitset, "best"
 /// means all available features, provided every required feature is present.
 pub fn selectBest(available: Capabilities, required: Capabilities) SelectError!Capabilities {
     if (!available.contains(required)) return error.MissingRequiredCapability;
@@ -509,7 +509,7 @@ test "loopback round-trip send recv across vtable" {
 
     var receive_buffer: [64]u8 = undefined;
     try rx.supplyReceiveBuffer(&receive_buffer);
-    const id = try tx.startSend("ryusen");
+    const id = try tx.startSend("adaptive");
 
     var send: [2]SendCompletion = undefined;
     try std.testing.expectEqual(@as(usize, 1), try tx.pollSendCompletions(&send));
@@ -519,7 +519,7 @@ test "loopback round-trip send recv across vtable" {
 
     var receive: [2]ReceiveCompletion = undefined;
     try std.testing.expectEqual(@as(usize, 1), try rx.pollReceiveCompletions(&receive));
-    try std.testing.expectEqualSlices(u8, "ryusen", receive[0].bytes());
+    try std.testing.expectEqualSlices(u8, "adaptive", receive[0].bytes());
 }
 
 test "capability negotiation accepts superset and rejects missing required" {

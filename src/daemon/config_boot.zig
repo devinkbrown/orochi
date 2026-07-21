@@ -176,11 +176,11 @@ pub fn mapToServerConfig(cfg: config_format.Config, base: server.Config) server.
         .max_ids_per_word = @intCast(cfg.history.search_max_ids_per_word),
         .max_token_bytes = @intCast(cfg.history.search_max_token_bytes),
     };
-    out.tegami_config = .{
-        .max_text_bytes = @intCast(cfg.bouncer.tegami_text_max_len),
-        .max_from_bytes = @intCast(cfg.bouncer.tegami_from_max_len),
-        .max_per_account = @intCast(cfg.bouncer.tegami_mailbox_depth),
-        .max_accounts = @intCast(cfg.bouncer.tegami_max_accounts),
+    out.memo_config = .{
+        .max_text_bytes = @intCast(cfg.bouncer.memo_text_max_len),
+        .max_from_bytes = @intCast(cfg.bouncer.memo_from_max_len),
+        .max_per_account = @intCast(cfg.bouncer.memo_mailbox_depth),
+        .max_accounts = @intCast(cfg.bouncer.memo_max_accounts),
     };
     out.content_filter_config = .{
         .max_patterns = @intCast(cfg.filter.koshi_max_patterns),
@@ -624,10 +624,10 @@ test "config text overlays the server config" {
         \\[io]
         \\cqe_batch = 512
         \\[bouncer]
-        \\tegami_text_max_len = 512
-        \\tegami_from_max_len = 48
-        \\tegami_mailbox_depth = 16
-        \\tegami_max_accounts = 4096
+        \\memo_text_max_len = 512
+        \\memo_from_max_len = 48
+        \\memo_mailbox_depth = 16
+        \\memo_max_accounts = 4096
         \\[filter]
         \\koshi_max_patterns = 512
         \\koshi_pattern_max_len = 128
@@ -698,10 +698,10 @@ test "config text overlays the server config" {
     _ = &rx;
     try testing.expect(loaded.config.native_media_require_mac);
     try testing.expectEqual(@as(u16, 512), loaded.config.cqe_batch);
-    try testing.expectEqual(@as(usize, 512), loaded.config.tegami_config.max_text_bytes);
-    try testing.expectEqual(@as(usize, 48), loaded.config.tegami_config.max_from_bytes);
-    try testing.expectEqual(@as(usize, 16), loaded.config.tegami_config.max_per_account);
-    try testing.expectEqual(@as(usize, 4096), loaded.config.tegami_config.max_accounts);
+    try testing.expectEqual(@as(usize, 512), loaded.config.memo_config.max_text_bytes);
+    try testing.expectEqual(@as(usize, 48), loaded.config.memo_config.max_from_bytes);
+    try testing.expectEqual(@as(usize, 16), loaded.config.memo_config.max_per_account);
+    try testing.expectEqual(@as(usize, 4096), loaded.config.memo_config.max_accounts);
     try testing.expectEqual(@as(usize, 4096), loaded.config.search_index_config.max_words);
     try testing.expectEqual(@as(usize, 128), loaded.config.search_index_config.max_ids_per_word);
     try testing.expectEqual(@as(usize, 32), loaded.config.search_index_config.max_token_bytes);

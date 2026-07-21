@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Tegami (手紙) — Onyx Server-native offline messaging keyed by account.
+//! Offline memo — Onyx Server-native offline messaging keyed by account.
 //!
-//! The bouncer rewind replays *channel* history a session missed; Tegami covers
+//! The bouncer rewind replays *channel* history a session missed; The offline memo service covers
 //! the other gap: a direct message left for an account that has no attached
 //! session. Messages are stored per recipient account and delivered when that
 //! account next logs in (REGISTER / IDENTIFY / SASL). In-memory + bounded; a
@@ -18,7 +18,7 @@ pub const default_max_accounts: usize = 65536;
 
 /// Runtime-tunable offline-mailbox limits. Defaults preserve the historical
 /// hardcoded behaviour; the orchestrator overlays the `[bouncer]` TOML section
-/// via `Config.applyToml` before constructing a `TegamiBox`.
+/// via `Config.applyToml` before constructing a `MemoBox`.
 pub const Config = struct {
     /// Max offline DM body length (bytes).
     max_text_bytes: usize = default_max_text_bytes,
@@ -32,16 +32,16 @@ pub const Config = struct {
     /// Overlay `[bouncer]` keys from a parsed TOML document onto `cfg`. Missing
     /// keys leave the current value untouched. Pure: no I/O, never fails.
     pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
-        if (doc.getUint("bouncer.tegami_text_max_len")) |v| {
+        if (doc.getUint("bouncer.memo_text_max_len")) |v| {
             if (v >= 1) cfg.max_text_bytes = @intCast(v);
         }
-        if (doc.getUint("bouncer.tegami_from_max_len")) |v| {
+        if (doc.getUint("bouncer.memo_from_max_len")) |v| {
             if (v >= 1) cfg.max_from_bytes = @intCast(v);
         }
-        if (doc.getUint("bouncer.tegami_mailbox_depth")) |v| {
+        if (doc.getUint("bouncer.memo_mailbox_depth")) |v| {
             if (v >= 1) cfg.max_per_account = @intCast(v);
         }
-        if (doc.getUint("bouncer.tegami_max_accounts")) |v| {
+        if (doc.getUint("bouncer.memo_max_accounts")) |v| {
             if (v >= 1) cfg.max_accounts = @intCast(v);
         }
     }
@@ -69,20 +69,20 @@ const Mailbox = struct {
     }
 };
 
-pub const TegamiBox = struct {
+pub const MemoBox = struct {
     allocator: std.mem.Allocator,
     boxes: std.StringHashMap(Mailbox),
     cfg: Config = .{},
 
-    pub fn init(allocator: std.mem.Allocator) TegamiBox {
+    pub fn init(allocator: std.mem.Allocator) MemoBox {
         return initWithConfig(allocator, .{});
     }
 
-    pub fn initWithConfig(allocator: std.mem.Allocator, cfg: Config) TegamiBox {
+    pub fn initWithConfig(allocator: std.mem.Allocator, cfg: Config) MemoBox {
         return .{ .allocator = allocator, .boxes = std.StringHashMap(Mailbox).init(allocator), .cfg = cfg };
     }
 
-    pub fn deinit(self: *TegamiBox) void {
+    pub fn deinit(self: *MemoBox) void {
         var it = self.boxes.iterator();
         while (it.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -95,7 +95,7 @@ pub const TegamiBox = struct {
     /// Store a message for `to_account` from `from`. Returns the new mailbox
     /// depth. Errors on empty/oversize fields, a full mailbox, or too many
     /// accounts. `from`/`text` are copied.
-    pub fn send(self: *TegamiBox, to_account: []const u8, from: []const u8, text: []const u8, now_ms: i64) Error!usize {
+    pub fn send(self: *MemoBox, to_account: []const u8, from: []const u8, text: []const u8, now_ms: i64) Error!usize {
         if (to_account.len == 0 or from.len == 0 or from.len > self.cfg.max_from_bytes) return error.MessageInvalid;
         if (text.len == 0 or text.len > self.cfg.max_text_bytes) return error.MessageInvalid;
         const box = try self.ensure(to_account);
@@ -111,18 +111,18 @@ pub const TegamiBox = struct {
 
     /// Borrowed pending messages for `account` (empty if none). Valid until the
     /// next mutation of this account's mailbox.
-    pub fn pending(self: *const TegamiBox, account: []const u8) []const Message {
+    pub fn pending(self: *const MemoBox, account: []const u8) []const Message {
         const box = self.boxes.getPtr(account) orelse return &.{};
         return box.items.items;
     }
 
-    pub fn count(self: *const TegamiBox, account: []const u8) usize {
+    pub fn count(self: *const MemoBox, account: []const u8) usize {
         return self.pending(account).len;
     }
 
     /// Drop all of `account`'s messages (e.g. after delivery). Returns how many
     /// were removed and prunes the (now-empty) mailbox.
-    pub fn clear(self: *TegamiBox, account: []const u8) usize {
+    pub fn clear(self: *MemoBox, account: []const u8) usize {
         const entry = self.boxes.getEntry(account) orelse return 0;
         const n = entry.value_ptr.items.items.len;
         entry.value_ptr.deinit(self.allocator);
@@ -132,7 +132,7 @@ pub const TegamiBox = struct {
         return n;
     }
 
-    fn ensure(self: *TegamiBox, account: []const u8) Error!*Mailbox {
+    fn ensure(self: *MemoBox, account: []const u8) Error!*Mailbox {
         if (self.boxes.getPtr(account)) |box| return box;
         if (self.boxes.count() >= self.cfg.max_accounts) return error.TooManyAccounts;
         const owned = try self.allocator.dupe(u8, account);
@@ -149,7 +149,7 @@ pub const TegamiBox = struct {
 const testing = std.testing;
 
 test "send then pending then clear" {
-    var t = TegamiBox.init(testing.allocator);
+    var t = MemoBox.init(testing.allocator);
     defer t.deinit();
     try testing.expectEqual(@as(usize, 0), t.count("alice"));
     try testing.expectEqual(@as(usize, 1), try t.send("alice", "bob", "hi alice", 100));
@@ -163,7 +163,7 @@ test "send then pending then clear" {
 }
 
 test "rejects invalid fields and enforces mailbox cap" {
-    var t = TegamiBox.init(testing.allocator);
+    var t = MemoBox.init(testing.allocator);
     defer t.deinit();
     try testing.expectError(error.MessageInvalid, t.send("alice", "bob", "", 0));
     try testing.expectError(error.MessageInvalid, t.send("alice", "", "hi", 0));
@@ -173,7 +173,7 @@ test "rejects invalid fields and enforces mailbox cap" {
 }
 
 test "mailboxes are independent per account" {
-    var t = TegamiBox.init(testing.allocator);
+    var t = MemoBox.init(testing.allocator);
     defer t.deinit();
     _ = try t.send("alice", "bob", "for alice", 0);
     _ = try t.send("carol", "bob", "for carol", 0);
@@ -192,10 +192,10 @@ test "Config defaults preserve historical limits" {
     try testing.expectEqual(default_max_accounts, cfg.max_accounts);
 }
 
-test "Config.applyToml overlays [bouncer] tegami keys" {
+test "Config.applyToml overlays [bouncer] memo keys" {
     var doc = try toml.parse(
         testing.allocator,
-        "[bouncer]\ntegami_text_max_len = 800\ntegami_from_max_len = 32\ntegami_mailbox_depth = 8\ntegami_max_accounts = 1024\n",
+        "[bouncer]\nmemo_text_max_len = 800\nmemo_from_max_len = 32\nmemo_mailbox_depth = 8\nmemo_max_accounts = 1024\n",
     );
     defer doc.deinit(testing.allocator);
 
@@ -208,7 +208,7 @@ test "Config.applyToml overlays [bouncer] tegami keys" {
 }
 
 test "initWithConfig enforces a smaller mailbox depth" {
-    var t = TegamiBox.initWithConfig(testing.allocator, .{ .max_per_account = 2 });
+    var t = MemoBox.initWithConfig(testing.allocator, .{ .max_per_account = 2 });
     defer t.deinit();
     _ = try t.send("alice", "bob", "one", 0);
     _ = try t.send("alice", "bob", "two", 0);

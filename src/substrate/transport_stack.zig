@@ -3,7 +3,7 @@
 
 //! Transport stack: composes the parallel-authored transport primitives into one
 //! congestion-controlled, paced, loss-recovering datagram sender behind the
-//! Ryūsen transport seam.
+//! adaptive transport seam.
 //!
 //!   send  -> cwnd gate (in-flight vs cc.cwnd) -> optional rate cap -> pacer ->
 //!            transport.startSend -> loss.onSent + pacer.onSent + qlog
@@ -18,7 +18,7 @@
 //! drops into the DST harness.
 const std = @import("std");
 
-const ryusen = @import("ryusen.zig");
+const adaptive_transport = @import("adaptive_transport.zig");
 const l4s = @import("l4s.zig");
 const bbr = @import("bbr.zig");
 const pacing = @import("pacing.zig");
@@ -156,7 +156,7 @@ pub const Recorder = qlog.Recorder(1024);
 
 pub const TransportStack = struct {
     allocator: std.mem.Allocator,
-    transport: ryusen.Transport,
+    transport: adaptive_transport.Transport,
     cc: CongestionControl,
     pacer: pacing.Pacer,
     rate_cap: ?flow.TokenBucket,
@@ -168,7 +168,7 @@ pub const TransportStack = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        transport: ryusen.Transport,
+        transport: adaptive_transport.Transport,
         cc: CongestionControl,
         recorder: *Recorder,
         cfg: Config,
@@ -215,7 +215,7 @@ pub const TransportStack = struct {
         const pn = self.next_pn;
         _ = try self.transport.startSend(payload);
 
-        var comps: [8]ryusen.SendCompletion = undefined;
+        var comps: [8]adaptive_transport.SendCompletion = undefined;
         const n = try self.transport.pollSendCompletions(&comps);
         var accepted: usize = 0;
         for (comps[0..n]) |c| accepted += c.bytes; // sent or dropped: both left the host
@@ -231,7 +231,7 @@ pub const TransportStack = struct {
     /// Pull one received datagram (or null). The caller owns `buffer`.
     pub fn recv(self: *TransportStack, buffer: []u8) !?[]u8 {
         try self.transport.supplyReceiveBuffer(buffer);
-        var comps: [4]ryusen.ReceiveCompletion = undefined;
+        var comps: [4]adaptive_transport.ReceiveCompletion = undefined;
         const n = try self.transport.pollReceiveCompletions(&comps);
         if (n == 0) return null;
         return comps[0].bytes();
@@ -299,11 +299,11 @@ fn pumpOnce(a: *LB, b: *LB) !void {
     try b.flush();
 }
 
-const LB = ryusen.LoopbackTransport;
+const LB = adaptive_transport.LoopbackTransport;
 
 test "two stacks: paced cwnd-limited delivery with ack-driven cwnd growth" {
     const allocator = testing.allocator;
-    var pairs = try ryusen.LoopbackTransport.pair(allocator, .{});
+    var pairs = try adaptive_transport.LoopbackTransport.pair(allocator, .{});
     defer pairs.deinit();
 
     var cc_a = l4s.Controller.init(.{ .initial_cwnd = 6000 });
@@ -348,7 +348,7 @@ test "two stacks: paced cwnd-limited delivery with ack-driven cwnd growth" {
 
 test "a gap (later pns acked) is detected as loss and drives cc.onLoss" {
     const allocator = testing.allocator;
-    var pairs = try ryusen.LoopbackTransport.pair(allocator, .{});
+    var pairs = try adaptive_transport.LoopbackTransport.pair(allocator, .{});
     defer pairs.deinit();
 
     var cc_a = l4s.Controller.init(.{ .initial_cwnd = 1_000_000 });

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Devin Brown <devin.kyle.brown@gmail.com>
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Allocation-free wire codec for an account's queued Tegami (offline/MEMO)
+//! Allocation-free wire codec for an account's queued Memo (offline/MEMO)
 //! messages.
 //!
 //! Used by the Helix in-process upgrade (UPGRADE command) to serialize each
@@ -9,7 +9,7 @@
 //! successor process, so messages left for an offline account survive a
 //! restart. The codec is pure and std-only: it never allocates. Decoded string
 //! slices borrow the input buffer, so the caller must keep that buffer alive for
-//! as long as the returned `TegamiCapsule` (and its `Memo` slice) is used.
+//! as long as the returned `MemoCapsule` (and its `Memo` slice) is used.
 //!
 //! Wire layout (all integers big-endian):
 //!   magic(4) version(1)
@@ -20,11 +20,11 @@
 //!     text:    u16 len + bytes
 //!     sent_ms: i64 (8 bytes)
 //!
-//! Mirrors the per-account fields in `daemon/tegami.zig` (`Message`).
+//! Mirrors the per-account fields in `daemon/memo.zig` (`Message`).
 
 const std = @import("std");
 
-/// File magic identifying a Tegami capsule record.
+/// File magic identifying a Memo capsule record.
 pub const magic = [_]u8{ 'H', 'T', 'G', 'M' };
 
 /// Wire format version. Bump on any incompatible layout change.
@@ -55,14 +55,14 @@ pub const Error = error{
 };
 
 /// An account's full set of queued offline messages.
-pub const TegamiCapsule = struct {
+pub const MemoCapsule = struct {
     account: []const u8,
     memos: []const Memo,
 
     /// Serialize `self` into `out`. Returns the written prefix of `out`.
     ///
     /// Returns `error.Truncated` if `out` is too small to hold the record.
-    pub fn encode(self: TegamiCapsule, out: []u8) Error![]const u8 {
+    pub fn encode(self: MemoCapsule, out: []u8) Error![]const u8 {
         var pos: usize = 0;
 
         // magic(4)
@@ -85,11 +85,11 @@ pub const TegamiCapsule = struct {
         return out[0..pos];
     }
 
-    /// Parse a `TegamiCapsule` from `bytes`, writing decoded memos into
+    /// Parse a `MemoCapsule` from `bytes`, writing decoded memos into
     /// `memos_out`. Returned string slices borrow `bytes`, which must outlive
     /// the result. Returns `error.TooMany` if the record holds more memos than
     /// `memos_out.len`.
-    pub fn decode(bytes: []const u8, memos_out: []Memo) Error!TegamiCapsule {
+    pub fn decode(bytes: []const u8, memos_out: []Memo) Error!MemoCapsule {
         var pos: usize = 0;
 
         const got_magic = try readBytes(bytes, &pos, magic.len);
@@ -190,13 +190,13 @@ test "round-trip an account with three memos" {
         .{ .from = "carol", .text = "", .sent_ms = -42 }, // empty text
         .{ .from = "dave", .text = "see you at 5", .sent_ms = 9_223_372_036_854 },
     };
-    const original = TegamiCapsule{ .account = "alice", .memos = &memos };
+    const original = MemoCapsule{ .account = "alice", .memos = &memos };
 
     var buf: [512]u8 = undefined;
     const wire = try original.encode(&buf);
 
     var out: [8]Memo = undefined;
-    const decoded = try TegamiCapsule.decode(wire, &out);
+    const decoded = try MemoCapsule.decode(wire, &out);
 
     try std.testing.expectEqualStrings("alice", decoded.account);
     try std.testing.expectEqual(@as(usize, 3), decoded.memos.len);
@@ -215,13 +215,13 @@ test "round-trip an account with three memos" {
 }
 
 test "round-trip an account with zero memos" {
-    const original = TegamiCapsule{ .account = "loner", .memos = &.{} };
+    const original = MemoCapsule{ .account = "loner", .memos = &.{} };
 
     var buf: [64]u8 = undefined;
     const wire = try original.encode(&buf);
 
     var out: [4]Memo = undefined;
-    const decoded = try TegamiCapsule.decode(wire, &out);
+    const decoded = try MemoCapsule.decode(wire, &out);
 
     try std.testing.expectEqualStrings("loner", decoded.account);
     try std.testing.expectEqual(@as(usize, 0), decoded.memos.len);
@@ -231,7 +231,7 @@ test "decode returns Truncated on a cut buffer" {
     const memos = [_]Memo{
         .{ .from = "bob", .text = "hello", .sent_ms = 5 },
     };
-    const original = TegamiCapsule{ .account = "alice", .memos = &memos };
+    const original = MemoCapsule{ .account = "alice", .memos = &memos };
 
     var buf: [256]u8 = undefined;
     const wire = try original.encode(&buf);
@@ -240,14 +240,14 @@ test "decode returns Truncated on a cut buffer" {
 
     // Cut into the middle of the last memo so a read runs past the buffer.
     const cut = wire[0 .. wire.len - 2];
-    try std.testing.expectError(error.Truncated, TegamiCapsule.decode(cut, &out));
+    try std.testing.expectError(error.Truncated, MemoCapsule.decode(cut, &out));
 
     // An empty buffer cannot even hold the magic.
-    try std.testing.expectError(error.Truncated, TegamiCapsule.decode(wire[0..0], &out));
+    try std.testing.expectError(error.Truncated, MemoCapsule.decode(wire[0..0], &out));
 }
 
 test "decode returns BadMagic on corrupted magic" {
-    const original = TegamiCapsule{ .account = "alice", .memos = &.{} };
+    const original = MemoCapsule{ .account = "alice", .memos = &.{} };
 
     var buf: [64]u8 = undefined;
     const wire = try original.encode(&buf);
@@ -257,11 +257,11 @@ test "decode returns BadMagic on corrupted magic" {
     corrupted[0] ^= 0xFF; // flip a magic byte
 
     var out: [4]Memo = undefined;
-    try std.testing.expectError(error.BadMagic, TegamiCapsule.decode(corrupted[0..wire.len], &out));
+    try std.testing.expectError(error.BadMagic, MemoCapsule.decode(corrupted[0..wire.len], &out));
 }
 
 test "decode returns BadVersion on a future version" {
-    const original = TegamiCapsule{ .account = "alice", .memos = &.{} };
+    const original = MemoCapsule{ .account = "alice", .memos = &.{} };
 
     var buf: [64]u8 = undefined;
     const wire = try original.encode(&buf);
@@ -271,7 +271,7 @@ test "decode returns BadVersion on a future version" {
     bumped[magic.len] = version +% 1; // version byte follows the magic
 
     var out: [4]Memo = undefined;
-    try std.testing.expectError(error.BadVersion, TegamiCapsule.decode(bumped[0..wire.len], &out));
+    try std.testing.expectError(error.BadVersion, MemoCapsule.decode(bumped[0..wire.len], &out));
 }
 
 test "decode returns TooMany when memos exceed the output slice" {
@@ -280,11 +280,11 @@ test "decode returns TooMany when memos exceed the output slice" {
         .{ .from = "b", .text = "2", .sent_ms = 2 },
         .{ .from = "c", .text = "3", .sent_ms = 3 },
     };
-    const original = TegamiCapsule{ .account = "alice", .memos = &memos };
+    const original = MemoCapsule{ .account = "alice", .memos = &memos };
 
     var buf: [256]u8 = undefined;
     const wire = try original.encode(&buf);
 
     var out: [2]Memo = undefined; // too small for 3 memos
-    try std.testing.expectError(error.TooMany, TegamiCapsule.decode(wire, &out));
+    try std.testing.expectError(error.TooMany, MemoCapsule.decode(wire, &out));
 }

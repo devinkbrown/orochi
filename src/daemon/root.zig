@@ -124,7 +124,7 @@ pub const svc_resv = @import("svc_resv.zig");
 pub const svc_sessionview = @import("svc_sessionview.zig");
 pub const svc_successor = @import("svc_successor.zig");
 pub const svc_tempmode = @import("svc_tempmode.zig");
-pub const tegami = @import("tegami.zig");
+pub const memo = @import("memo.zig");
 pub const webpush = @import("webpush.zig");
 pub const webauthn_creds = @import("webauthn_creds.zig");
 pub const tiered_keys = @import("tiered_keys.zig");
@@ -269,7 +269,7 @@ test {
     _ = svc_sessionview;
     _ = svc_successor;
     _ = svc_tempmode;
-    _ = tegami;
+    _ = memo;
     _ = webpush;
     _ = webauthn_creds;
     _ = tiered_keys;

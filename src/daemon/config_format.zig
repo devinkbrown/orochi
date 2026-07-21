@@ -21,7 +21,7 @@ const content_filter_mod = @import("content_filter.zig");
 const services_mod = @import("services.zig");
 const shard = @import("shard.zig");
 const store_mod = @import("store.zig");
-const tegami_mod = @import("tegami.zig");
+const memo_mod = @import("memo.zig");
 const transcript_mod = @import("transcript.zig");
 const sasl_mechrouter = @import("../proto/sasl_mechrouter.zig");
 const crypto_sign = @import("../crypto/sign.zig");
@@ -334,7 +334,7 @@ pub const Config = struct {
         /// This is deliberately distinct from direct-neighbor `trust_roots`.
         relay_v2_roster: []const []const u8 = &.{},
         /// Runtime Undertow peer-driver limits/timers/capacities projected from
-        /// `[mesh.routing]`, `[mesh.link]`, `[mesh.gossip]`, and `[mesh.sazanami]`.
+        /// `[mesh.routing]`, `[mesh.link]`, `[mesh.gossip]`, and `[mesh.ripple]` (legacy TOML key: `mesh.sazanami`).
         s2s: s2s_peer_mod.Config = .{},
         /// Peers this node dials automatically at boot (and re-dials while the
         /// link is down), each a "host:port" string (IPv6 hosts bracketed,
@@ -554,13 +554,13 @@ pub const Config = struct {
     /// `[bouncer]` — per-account bouncer/offline-message retention limits.
     pub const Bouncer = struct {
         /// Max offline DM body length (bytes).
-        tegami_text_max_len: u64 = tegami_mod.default_max_text_bytes,
+        memo_text_max_len: u64 = memo_mod.default_max_text_bytes,
         /// Max sender-name length on an offline DM (bytes).
-        tegami_from_max_len: u64 = tegami_mod.default_max_from_bytes,
+        memo_from_max_len: u64 = memo_mod.default_max_from_bytes,
         /// Offline mailbox depth cap per account (entries).
-        tegami_mailbox_depth: u64 = tegami_mod.default_max_per_account,
+        memo_mailbox_depth: u64 = memo_mod.default_max_per_account,
         /// Max distinct offline mailboxes.
-        tegami_max_accounts: u64 = tegami_mod.default_max_accounts,
+        memo_max_accounts: u64 = memo_mod.default_max_accounts,
     };
 
     /// `[filter]` — oper-managed moderation filter sizing.
@@ -746,7 +746,7 @@ pub const Config = struct {
     /// In-daemon ACME renewal scheduler. Issuance uses the existing ACME runner
     /// and writes to the configured `[tls]` cert/key paths; this section only
     /// controls cadence and CA/account inputs.
-    /// `[webpush]` — browser Web Push delivery for offline DMs (tegami).
+    /// `[webpush]` — browser Web Push delivery for offline DMs (memo).
     /// Off by default; enabling needs an account store (subscriptions are
     /// account-scoped) and outbound HTTPS (same trust anchors as ACME).
     pub const Webpush = struct {
@@ -1234,10 +1234,15 @@ pub fn parseToml(allocator: std.mem.Allocator, source: []const u8, resolver: Res
     if (cfg.accounts.password_min_len > cfg.accounts.password_max_len) return error.ParseError;
 
     // [bouncer]
-    cfg.bouncer.tegami_text_max_len = try uintField(doc, "bouncer.tegami_text_max_len", cfg.bouncer.tegami_text_max_len, 64, 2048);
-    cfg.bouncer.tegami_from_max_len = try uintField(doc, "bouncer.tegami_from_max_len", cfg.bouncer.tegami_from_max_len, 16, 128);
-    cfg.bouncer.tegami_mailbox_depth = try uintField(doc, "bouncer.tegami_mailbox_depth", cfg.bouncer.tegami_mailbox_depth, 8, 1024);
-    cfg.bouncer.tegami_max_accounts = try uintField(doc, "bouncer.tegami_max_accounts", cfg.bouncer.tegami_max_accounts, 1024, 1048576);
+    cfg.bouncer.memo_text_max_len = try uintField(doc, "bouncer.memo_text_max_len", cfg.bouncer.memo_text_max_len, 64, 2048);
+    // Legacy bouncer.tegami_* keys (one rename window).
+    cfg.bouncer.memo_text_max_len = try uintField(doc, "bouncer.tegami_text_max_len", cfg.bouncer.memo_text_max_len, 64, 2048);
+    cfg.bouncer.memo_from_max_len = try uintField(doc, "bouncer.memo_from_max_len", cfg.bouncer.memo_from_max_len, 16, 128);
+    cfg.bouncer.memo_from_max_len = try uintField(doc, "bouncer.tegami_from_max_len", cfg.bouncer.memo_from_max_len, 16, 128);
+    cfg.bouncer.memo_mailbox_depth = try uintField(doc, "bouncer.memo_mailbox_depth", cfg.bouncer.memo_mailbox_depth, 8, 1024);
+    cfg.bouncer.memo_mailbox_depth = try uintField(doc, "bouncer.tegami_mailbox_depth", cfg.bouncer.memo_mailbox_depth, 8, 1024);
+    cfg.bouncer.memo_max_accounts = try uintField(doc, "bouncer.memo_max_accounts", cfg.bouncer.memo_max_accounts, 1024, 1048576);
+    cfg.bouncer.memo_max_accounts = try uintField(doc, "bouncer.tegami_max_accounts", cfg.bouncer.memo_max_accounts, 1024, 1048576);
 
     // [filter]
     cfg.filter.koshi_max_patterns = try uintField(doc, "filter.koshi_max_patterns", cfg.filter.koshi_max_patterns, 16, 4096);
@@ -1883,10 +1888,13 @@ fn parseMeshS2sConfig(doc: toml.Document, cfg: *s2s_peer_mod.Config) TomlError!v
     cfg.link.view_config.shuffle_active_count = @intCast(try uintField(doc, "mesh.gossip.view_shuffle_active", cfg.link.view_config.shuffle_active_count, 0, cfg.link.view_config.active_capacity));
     cfg.link.view_config.shuffle_passive_count = @intCast(try uintField(doc, "mesh.gossip.view_shuffle_passive", cfg.link.view_config.shuffle_passive_count, 0, cfg.link.view_config.passive_capacity));
 
+    // Prefer mesh.ripple.*; accept legacy mesh.sazanami.* for one rename window.
     cfg.link.ripple_config.suspicion_timeout_ms = @intCast(try uintField(doc, "mesh.sazanami.suspicion_timeout_ms", @as(u64, @intCast(cfg.link.ripple_config.suspicion_timeout_ms)), 0, 120_000));
+    cfg.link.ripple_config.suspicion_timeout_ms = @intCast(try uintField(doc, "mesh.ripple.suspicion_timeout_ms", @as(u64, @intCast(cfg.link.ripple_config.suspicion_timeout_ms)), 0, 120_000));
     // Floor of 2: a single accuser must never bury a peer (see gossip_round.zig
     // RippleConfig.sanitized). Reject a configured quorum of 0/1 at parse time.
     cfg.link.ripple_config.witness_quorum = @intCast(try uintField(doc, "mesh.sazanami.witness_quorum", cfg.link.ripple_config.witness_quorum, 2, 16));
+    cfg.link.ripple_config.witness_quorum = @intCast(try uintField(doc, "mesh.ripple.witness_quorum", cfg.link.ripple_config.witness_quorum, 2, 16));
 
     cfg.link.peer_link_config.send_credit = @intCast(try uintField(doc, "mesh.link.send_credit_bytes", cfg.link.peer_link_config.send_credit, 4096, 16_777_216));
     cfg.link.peer_link_config.replay_window = try uintField(doc, "mesh.link.replay_window", cfg.link.peer_link_config.replay_window, 8, 4096);
@@ -2385,7 +2393,7 @@ test "parseToml: [accounts] pbkdf2 rounds project with bounded policy range" {
     , .{}));
 }
 
-test "parseToml: [bouncer] tegami limits project with bounded policy ranges" {
+test "parseToml: [bouncer] memo limits project with bounded policy ranges" {
     const allocator = testing.allocator;
     const text =
         \\[node]
@@ -2393,25 +2401,25 @@ test "parseToml: [bouncer] tegami limits project with bounded policy ranges" {
         \\[listen]
         \\irc = 6680
         \\[bouncer]
-        \\tegami_text_max_len = 512
-        \\tegami_from_max_len = 48
-        \\tegami_mailbox_depth = 16
-        \\tegami_max_accounts = 2048
+        \\memo_text_max_len = 512
+        \\memo_from_max_len = 48
+        \\memo_mailbox_depth = 16
+        \\memo_max_accounts = 2048
         \\
     ;
     var cfg = try parseToml(allocator, text, .{});
     defer cfg.deinit(allocator);
-    try testing.expectEqual(@as(u64, 512), cfg.bouncer.tegami_text_max_len);
-    try testing.expectEqual(@as(u64, 48), cfg.bouncer.tegami_from_max_len);
-    try testing.expectEqual(@as(u64, 16), cfg.bouncer.tegami_mailbox_depth);
-    try testing.expectEqual(@as(u64, 2048), cfg.bouncer.tegami_max_accounts);
+    try testing.expectEqual(@as(u64, 512), cfg.bouncer.memo_text_max_len);
+    try testing.expectEqual(@as(u64, 48), cfg.bouncer.memo_from_max_len);
+    try testing.expectEqual(@as(u64, 16), cfg.bouncer.memo_mailbox_depth);
+    try testing.expectEqual(@as(u64, 2048), cfg.bouncer.memo_max_accounts);
 
     var omitted = try parseToml(allocator, "[node]\nid = 1\n[listen]\nirc = 6680\n", .{});
     defer omitted.deinit(allocator);
-    try testing.expectEqual(@as(u64, tegami_mod.default_max_text_bytes), omitted.bouncer.tegami_text_max_len);
-    try testing.expectEqual(@as(u64, tegami_mod.default_max_from_bytes), omitted.bouncer.tegami_from_max_len);
-    try testing.expectEqual(@as(u64, tegami_mod.default_max_per_account), omitted.bouncer.tegami_mailbox_depth);
-    try testing.expectEqual(@as(u64, tegami_mod.default_max_accounts), omitted.bouncer.tegami_max_accounts);
+    try testing.expectEqual(@as(u64, memo_mod.default_max_text_bytes), omitted.bouncer.memo_text_max_len);
+    try testing.expectEqual(@as(u64, memo_mod.default_max_from_bytes), omitted.bouncer.memo_from_max_len);
+    try testing.expectEqual(@as(u64, memo_mod.default_max_per_account), omitted.bouncer.memo_mailbox_depth);
+    try testing.expectEqual(@as(u64, memo_mod.default_max_accounts), omitted.bouncer.memo_max_accounts);
 
     try testing.expectError(error.ParseError, parseToml(allocator,
         \\[node]
@@ -2419,7 +2427,7 @@ test "parseToml: [bouncer] tegami limits project with bounded policy ranges" {
         \\[listen]
         \\irc = 6680
         \\[bouncer]
-        \\tegami_text_max_len = 63
+        \\memo_text_max_len = 63
         \\
     , .{}));
     try testing.expectError(error.ParseError, parseToml(allocator,
@@ -2428,7 +2436,7 @@ test "parseToml: [bouncer] tegami limits project with bounded policy ranges" {
         \\[listen]
         \\irc = 6680
         \\[bouncer]
-        \\tegami_mailbox_depth = 1025
+        \\memo_mailbox_depth = 1025
         \\
     , .{}));
 }
@@ -2941,7 +2949,7 @@ test "parseToml: live mesh S2S sub-sections project onto peer driver config" {
         \\view_passive_capacity = 80
         \\view_shuffle_active = 3
         \\view_shuffle_passive = 6
-        \\[mesh.sazanami]
+        \\[mesh.ripple]
         \\suspicion_timeout_ms = 9000
         \\witness_quorum = 4
         \\[mesh.link]

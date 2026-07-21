@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Causeway — the SFU media bridge between Onyx Server's native
-//! Undertow media plane (cadence frames over CoilPack/ryusen + secure_channel)
+//! Undertow media plane (cadence frames over CoilPack/adaptive_transport + secure_channel)
 //! and the WebRTC gateway (RTP/SRTP, for mobile / hardware-codec clients).
 //!
 //! The SFU forwards a transport-neutral `BridgeFrame`; each egress leg

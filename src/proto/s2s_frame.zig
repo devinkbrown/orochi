@@ -101,11 +101,12 @@ pub const FrameType = enum(u8) {
     REPAIR_REQUEST = 0x1A,
     /// Repair records that backfill the requested CRDT entities.
     REPAIR_RESPONSE = 0x1B,
-    /// Signed, secured-only Web Push hint for an offline Tegami/DM notification.
-    /// Carries a bounded `tegami_push_relay` record: {account, from, text preview}.
+    /// Signed, secured-only Web Push hint for an offline memo/DM notification.
+    /// Carries a bounded `memo_push_relay` record: {account, from, text preview}.
     /// The receiving node only runs its LOCAL Web Push worker/subscription store;
-    /// no Tegami message or subscription state is replicated by this frame.
-    TEGAMI_PUSH = 0x1C,
+    /// no memo message or subscription state is replicated by this frame.
+    /// Numeric tag 0x1C is wire-stable (historical name TEGAMI_PUSH).
+    MEMO_PUSH = 0x1C,
     /// Signed consume tombstone for a portable session migration. Peers remove
     /// staged copies and retain a token tombstone so delayed offers cannot fork.
     SESSION_MIGRATE_CONSUMED = 0x1D,
@@ -163,7 +164,7 @@ pub const FrameType = enum(u8) {
             @intFromEnum(FrameType.REPAIR_SUMMARY) => .REPAIR_SUMMARY,
             @intFromEnum(FrameType.REPAIR_REQUEST) => .REPAIR_REQUEST,
             @intFromEnum(FrameType.REPAIR_RESPONSE) => .REPAIR_RESPONSE,
-            @intFromEnum(FrameType.TEGAMI_PUSH) => .TEGAMI_PUSH,
+            @intFromEnum(FrameType.MEMO_PUSH) => .MEMO_PUSH,
             @intFromEnum(FrameType.SESSION_MIGRATE_CONSUMED) => .SESSION_MIGRATE_CONSUMED,
             @intFromEnum(FrameType.SESSION_REPLICA_OFFER) => .SESSION_REPLICA_OFFER,
             @intFromEnum(FrameType.SESSION_REPLICA_ACK) => .SESSION_REPLICA_ACK,
@@ -357,7 +358,7 @@ pub const frame_catalog = [_]FrameSpec{
     .{ .frame_type = .REPAIR_SUMMARY, .token = "REPAIR_SUMMARY", .family = .repair, .auth = .signed, .capability_mask = cap_repair_frames, .summary = "Merkle/RBSR anti-entropy summary." },
     .{ .frame_type = .REPAIR_REQUEST, .token = "REPAIR_REQUEST", .family = .repair, .auth = .signed, .capability_mask = cap_repair_frames, .summary = "Request for CRDT records whose hashes differ from a repair summary." },
     .{ .frame_type = .REPAIR_RESPONSE, .token = "REPAIR_RESPONSE", .family = .repair, .auth = .signed, .capability_mask = cap_repair_frames, .summary = "Repair records that backfill requested CRDT entities." },
-    .{ .frame_type = .TEGAMI_PUSH, .token = "TEGAMI_PUSH", .family = .notification, .auth = .secured_signed, .summary = "Secured-only Web Push hint for offline Tegami delivery." },
+    .{ .frame_type = .MEMO_PUSH, .token = "MEMO_PUSH", .family = .notification, .auth = .secured_signed, .summary = "Secured-only Web Push hint for offline memo delivery." },
     .{ .frame_type = .SESSION_MIGRATE_CONSUMED, .token = "SESSION_MIGRATE_CONSUMED", .family = .relay, .auth = .signed, .summary = "Converges a successful session claim and prevents stale migration resurrection." },
     .{ .frame_type = .SESSION_REPLICA_OFFER, .token = "SESSION_REPLICA_OFFER", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed upsert offer." },
     .{ .frame_type = .SESSION_REPLICA_ACK, .token = "SESSION_REPLICA_ACK", .family = .session, .auth = .secured_signed, .capability_mask = cap_session_replica_v2, .summary = "SESSION_REPLICA v2 signed acknowledgment and route observation." },

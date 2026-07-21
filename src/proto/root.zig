@@ -300,7 +300,7 @@ pub const sts = @import("sts.zig");
 pub const stun_ice_attrs = @import("stun_ice_attrs.zig");
 pub const stun = @import("stun.zig");
 pub const supported_groups = @import("supported_groups.zig");
-pub const tegami_push_relay = @import("tegami_push_relay.zig");
+pub const memo_push_relay = @import("memo_push_relay.zig");
 pub const tls12_extensions = @import("tls12_extensions.zig");
 pub const tls12_handshake = @import("tls12_handshake.zig");
 pub const tls12_key_exchange = @import("tls12_key_exchange.zig");
@@ -653,7 +653,7 @@ test {
     _ = stun_ice_attrs;
     _ = stun;
     _ = supported_groups;
-    _ = tegami_push_relay;
+    _ = memo_push_relay;
     _ = tls12_extensions;
     _ = tls12_handshake;
     _ = tls12_key_exchange;

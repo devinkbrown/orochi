@@ -983,7 +983,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // ── Web Push delivery worker ([webpush] enabled + account store) ────────
-    // Offline DMs (tegami) nudge the recipient's browser through their push
+    // Offline DMs (memo) nudge the recipient's browser through their push
     // service — payloads are RFC 8291-encrypted end-to-end to the browser.
     const WebpushWorker = if (builtin.os.tag == .linux) onyx_server.daemon.webpush.Worker else void;
     var webpush_worker: ?*WebpushWorker = null;

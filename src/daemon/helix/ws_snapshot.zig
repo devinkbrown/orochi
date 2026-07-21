@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
 //! Per-client WebSocket resume snapshot — carried across a Helix UPGRADE so an
-//! ESTABLISHED wss browser client (Ruri and friends) keeps its socket instead
+//! ESTABLISHED wss browser client keeps its socket instead
 //! of being dropped and forced to reconnect on every hot upgrade.
 //!
 //! A wss client is layered TLS-then-WebSocket. The TLS crypto state rides its

@@ -77,7 +77,7 @@ states the exact trust boundary and independent rebuild path.
   Zig; `comptime` powers the module machinery and generates wire codecs and
   dispatch tables.
 - **Mesh, not tree.** **Undertow** (水脈) — a CRDT state mesh with Ripple gossip and
-  Merkle anti-entropy — over **Mooring** (紬) — a post-quantum-hybrid (X25519 + ML-KEM-768)
+  Merkle anti-entropy — over **Mooring** — a post-quantum-hybrid (X25519 + ML-KEM-768)
   forward-secret ratchet. No TS6. Operator surfaces are network-wide: the Event Spine
   (connect/quit/oper alerts and the targeted `EVENT OBSERVE` feed) fans every event to
   all nodes rendered with the origin server, and a cross-node `MODE` shows the setter's
