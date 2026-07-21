@@ -226,14 +226,14 @@ ONYX_SERVER = Project(
         f"Formerly codenamed Orochi; same engine, honest name.",
         f"IRCv3/IRCX + accounts/SASL, multi-session bouncer, Event Spine, and Cadence "
         f"media conferencing (rooms, roster, hop-secured SFU path).",
-        f"Mesh = Undertow CRDT over Mooring secure S2S, Warden anti-abuse, Tegami "
+        f"Mesh = Undertow CRDT over Mooring secure S2S, Warden anti-abuse, MEMO "
         f"offline mail / Web Push. One static musl binary, zero external deps.",
         f"Built max-parallel (Claude + Codex). repo: {ONYX_SERVER_REPO}",
     ),
     roadmap=(
         "core ✔ · IRCv3/IRCX ✔ · accounts/SASL ✔ · multi-session bouncer ✔ · "
         "host-cloak/VHOST/CHGHOST ✔",
-        "Warden + flood/clone ✔ · media plane ✔ · Tegami/Web Push ✔ · Helix USR2 ✔",
+        "Warden + flood/clone ✔ · media plane ✔ · MEMO/Web Push ✔ · Helix USR2 ✔",
         "mesh: Undertow CRDT + Mooring S2S + anti-entropy",
         "next: public GitHub Release binary (A10) · operator packaging polish",
     ),
