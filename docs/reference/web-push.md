@@ -3,7 +3,7 @@
 *Server-sent browser push notifications for offline recipients — RFC 8291 message
 encryption and RFC 8292 VAPID authorization, delivered by a background worker.*
 
-Onyx Server can nudge a logged-out account's browser when an offline DM (tegami) arrives,
+Onyx Server can nudge a logged-out account's browser when an offline DM (memo) arrives,
 so the recipient sees it "with the tab closed." The push body is encrypted
 end-to-end to the browser: the server never holds a plaintext channel to the push
 service, only ciphertext it forwards. The message crypto is a pure, deterministic
@@ -48,9 +48,9 @@ and decrypts it, proving salt and keys thread through correctly
 
 ## The `WEBPUSH` command
 
-Registered by `feature.misc` (`src/daemon/modules/feature_misc.zig:31-33`,
-`src/daemon/modules/feature_misc.zig:61-62`), dispatched to `handleWebpush` in
-`server.zig` (`src/daemon/server.zig:25674-25682`). Account-scoped; a client
+Registered by `feature.misc` (`src/daemon/modules/feature_misc.zig:31`,
+`src/daemon/modules/feature_misc.zig:64`), dispatched to `handleWebpush` in
+`server.zig` (`src/daemon/server.zig:40854`). Account-scoped; a client
 must be logged in. Keys are passed exactly as `PushSubscription.getKey()` gives
 them (base64url-unpadded).
 
@@ -97,14 +97,15 @@ Spine (`src/daemon/server.zig:25745-25749`, `src/daemon/server.zig:25775-25778`)
 
 ## Delivery: trigger, worker, storage
 
-**Trigger (tegami).** After `handleTegami` successfully stores an offline DM, it
+**Trigger (memo).** After `handleMemo` successfully stores an offline DM, it
 calls `webpushNotify(recipient, from, text)` and
-`meshBroadcastTegamiPush(recipient, from, text)` — best-effort nudges; the
-Tegami store remains the message source of truth (`src/daemon/server.zig:25649-25661`).
+`meshBroadcastMemoPush(recipient, from, text)` — best-effort nudges; the
+local memo store remains the message source of truth (`src/daemon/server.zig:40832`,
+`src/daemon/server.zig:40833`).
 `webpushNotify` builds a compact JSON payload
 `{"type":"dm","from":…,"text":…}` (text preview truncated to 240 bytes so it always
 fits one encrypted record, escaped by `writeJsonEscaped`) and enqueues one job per
-stored subscription (`src/daemon/server.zig:25813-25853`).
+stored subscription (`src/daemon/server.zig:40988`).
 
 **Worker.** `webpush.Worker` is a background thread draining a bounded job queue
 (`max_queued_jobs` 256; a full queue drops the push). Reactor threads only ever
@@ -130,11 +131,12 @@ family under a private `wps\x00<account>` key
 **own** VAPID key, so a browser's subscription is inherently bound to the node it
 subscribed through (`src/daemon/webpush.zig:157-187`, `src/main.zig:286-295`).
 Subscriptions and workers are node-local, but secured mesh peers can receive a
-bounded `TEGAMI_PUSH` hint and run their **own** local Web Push worker for the
-same account if they already hold a local subscription; the hint carries only
-account/from/text preview, never subscription or VAPID material
-(`src/daemon/server.zig:25856-25887`, `src/daemon/s2s_link.zig:557-567`,
-`src/daemon/secured_s2s_link.zig:731-743`, `src/proto/tegami_push_relay.zig:4-12`).
+bounded `MEMO_PUSH` hint (frame tag `0x1C`) and run their **own** local Web Push
+worker for the same account if they already hold a local subscription; the hint
+carries only account/from/text preview, never subscription or VAPID material
+(`src/daemon/server.zig:41032`, `src/daemon/server.zig:41048`,
+`src/daemon/s2s_link.zig:825`, `src/daemon/secured_s2s_link.zig:1090`,
+`src/proto/memo_push_relay.zig:4`, `src/proto/s2s_frame.zig:109`).
 
 ## Lifecycle on the Event Spine
 

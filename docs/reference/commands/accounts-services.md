@@ -7,7 +7,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 ## REGISTER
 
 - Syntax: `REGISTER <account|*> <email|*> <password>`
-- Description: Registers an account immediately and logs the session in. `*` uses the current nick as the account name. When mail is configured and an email is supplied, the verification code is sent out of band and the client gets a notice telling it to run `VERIFY <code>`; the code is not shown in-band. Registration applies SASL-account oper elevation when configured, tracks the session, delivers tegami, applies autojoin, and emits welcome and client-registration side effects.
+- Description: Registers an account immediately and logs the session in. `*` uses the current nick as the account name. When mail is configured and an email is supplied, the verification code is sent out of band and the client gets a notice telling it to run `VERIFY <code>`; the code is not shown in-band. Registration applies SASL-account oper elevation when configured, tracks the session, delivers pending memos, applies autojoin, and emits welcome and client-registration side effects.
 - Privileges: Registered client.
 - Parameters: Account, email or `*`, password.
 - Replies: Raw `REGISTER SUCCESS <account> :Account registered`, optional email-status notice, welcome/account side effects.
@@ -29,7 +29,7 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 ## IDENTIFY
 
 - Syntax: `IDENTIFY <account> <password> [<2fa-code>]`
-- Description: Authenticates to an existing account and logs the session in. Performs derived oper elevation, tracks the session, delivers tegami, applies autojoin, and emits login side effects. When the account has TOTP two-factor auth active (see `TOTP`), a valid 6-digit code is required as the third parameter; a correct password with a missing or wrong code is a failed login (and counts against the brute-force throttle).
+- Description: Authenticates to an existing account and logs the session in. Performs derived oper elevation, tracks the session, delivers pending memos, applies autojoin, and emits login side effects. When the account has TOTP two-factor auth active (see `TOTP`), a valid 6-digit code is required as the third parameter; a correct password with a missing or wrong code is a failed login (and counts against the brute-force throttle).
 - Privileges: Registered client.
 - Parameters: Account, password, and — for 2FA accounts — the current TOTP code.
 - Replies: Server `NOTICE` confirming login plus account-notify/welcome side effects.
@@ -257,16 +257,16 @@ The `accounts` module registers the account and service commands (`src/daemon/mo
 - Example: `IDENTITY ADD primary <64-hex-pubkey> <128-hex-signature>`
 - Sources: `src/daemon/modules/accounts.zig`, `src/daemon/server.zig` `handleIdentity`, `src/proto/account_identity.zig`
 
-## TEGAMI
+## MEMO
 
-- Syntax: `TEGAMI [LIST|CLEAR|SEND <account> :message]` (alias: `MEMO`)
-- Description: Offline account messages (手紙 — "letter"); `MEMO` is an alias for the same command. `LIST` is the default and does not clear; login delivery clears pending messages.
-- Privileges: Registered client; account login required for list/clear/send.
-- Parameters: Optional subcommand; `SEND` target account and message.
-- Replies: Server notices for message lists, clear count, forwarding, ignore lists, and delivery. Clear/forward mutations are also published on the Event Spine service plane.
-- Errors: `ERR_NEEDMOREPARAMS 461`, `FAIL TEGAMI ACCOUNT_REQUIRED`, `ACCOUNT_UNKNOWN`, `MAILBOX_FULL`, `INVALID_MESSAGE`, `TEMPORARILY_UNAVAILABLE`, `INVALID_SUBCOMMAND`.
-- Example: `TEGAMI SEND alice :ping me later`
-- Sources: `src/daemon/modules/feature_misc.zig:53`, `src/daemon/server.zig:9030`
+- Syntax: `MEMO [LIST|CLEAR|SEND <account> :message|FORWARD [<account>|OFF|NONE]|IGNORE [ADD|DEL|LIST] [<account>]]`
+- Description: Onyx Server offline account messages keyed by recipient account. A direct message left for an account with no attached session is stored in the local memo mailbox and delivered when that account next logs in (`REGISTER` / `IDENTIFY` / SASL). `LIST` is the default subcommand and does not clear; login delivery clears pending messages. `SEND` stores for a known account, follows the recipient's forward chain when set, and silently drops when the recipient ignores the sender (success reply unchanged so the block cannot be probed). After a successful store, the node best-effort nudges local Web Push and broadcasts a secured `MEMO_PUSH` hint to mesh peers.
+- Privileges: Registered client; account login required for every subcommand.
+- Parameters: Optional subcommand. `SEND` takes a target account and message body. `FORWARD` with no target reports the current forward; `OFF`/`NONE` clears it. `IGNORE ADD|DEL` takes a blocked-sender account; bare `IGNORE`/`IGNORE LIST` lists entries.
+- Replies: Server notices — `MEMO from <from> :<text>`, `MEMO: End of offline memos (<n>)`, clear/forward/ignore confirmations, and `MEMO: message stored for delivery` (or `… (forwarded to <account>)`). Clear/forward mutations also publish on the Event Spine service plane.
+- Errors: `ERR_NEEDMOREPARAMS 461`, `FAIL MEMO ACCOUNT_REQUIRED`, `ACCOUNT_UNKNOWN`, `MAILBOX_FULL`, `INVALID_MESSAGE`, `TEMPORARILY_UNAVAILABLE`, `INVALID_SUBCOMMAND`, `FORWARD_CYCLE`, `INVALID_ACCOUNT`.
+- Example: `MEMO SEND alice :ping me later`
+- Sources: `src/daemon/modules/feature_misc.zig:61`, `src/daemon/server.zig:40648`, `src/daemon/server.zig:40655`, `src/daemon/memo.zig:4`
 
 ## VHOST
 

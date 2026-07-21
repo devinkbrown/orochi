@@ -28,7 +28,7 @@ only for the platform syscalls that require it.
 | `zig build test-event-spine` | Runs focused event-spine, EVENT, observe, and playback tests. | `build.zig` |
 | `zig build test-mesh` | Runs focused Undertow mesh, S2S, repair, and secured-link tests. | `build.zig` |
 | `zig build test-media` | Runs focused media, DTLS-SRTP, SFU, native-media, WebTransport, RTP, and RTCP tests. | `build.zig` |
-| `zig build test-services` | Runs focused services, account, SASL, TOTP, WebAuthn, session, and Tegami tests. | `build.zig` |
+| `zig build test-services` | Runs focused services, account, SASL, TOTP, WebAuthn, session, and MEMO tests. | `build.zig` |
 | `zig build test-helix` | Runs focused Helix upgrade, migration, resume, capsule, and handoff tests. | `build.zig` |
 | `zig build test-cli` | Runs the `armor` crypto CLI toolkit tests. | `build.zig` |
 | `zig build test-smoke` | Runs `check` plus focused TLS/server/config suites. | `build.zig` |

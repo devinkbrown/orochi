@@ -81,7 +81,7 @@ authoritative.
 
 ## Protocol reference
 
-- [Codename glossary](reference/glossary.md) — the mythos vocabulary (Undertow, Mooring, Ripple, Helix, Armor, Ringlane, Koshi, Tegami, MeshPass) mapped to source
+- [Codename glossary](reference/glossary.md) — the mythos vocabulary (Undertow, Mooring, Ripple, Helix, Armor, Ringlane, Koshi, Memo, MeshPass) mapped to source
 - [Numerics](reference/protocol/numerics.md)
 - [Modes](reference/protocol/modes.md) — user and channel modes, status prefixes
 - [ISUPPORT (005)](reference/protocol/isupport.md)

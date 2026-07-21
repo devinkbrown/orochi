@@ -65,7 +65,7 @@ The daemon also keeps operational mesh state outside the substrate: peer health,
 | `REPAIR_SUMMARY` | `0x19` | repair | signed | `repair-frames` | Merkle-guided anti-entropy summary. |
 | `REPAIR_REQUEST` | `0x1A` | repair | signed | `repair-frames` | Request for CRDT records whose hashes differ from a repair summary. |
 | `REPAIR_RESPONSE` | `0x1B` | repair | signed | `repair-frames` | Repair records that backfill requested CRDT entities. |
-| `TEGAMI_PUSH` | `0x1C` | notification | secured-signed | - | Secured-only Web Push hint for offline Tegami delivery. |
+| `MEMO_PUSH` | `0x1C` | notification | secured-signed | - | Secured-only Web Push hint for offline memo delivery (`src/proto/s2s_frame.zig:109`, `src/proto/memo_push_relay.zig:4`). |
 
 > Unknown frame tags are forward-tolerant as long as the length header is valid:
 > the decoder skips unknown length-delimited frames instead of tearing the link

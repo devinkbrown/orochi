@@ -47,7 +47,7 @@ AUTH <package> <sequence> [:<data>]
   are other/continuation factors and pass.
 - **On success** the session is logged in (or made a guest), account metadata
   and silence lists are restored, oper elevation is applied where the package
-  permits it, and the normal post-registration burst (tegami, autojoin,
+  permits it, and the normal post-registration burst (memo, autojoin,
   welcome) follows.
 
 ## Discovery

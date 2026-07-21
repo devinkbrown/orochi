@@ -51,7 +51,7 @@ codename in the guides and architecture docs links here.
 | **Ringlane** | The reactor seam: all time and I/O flow through `Reactor`, so the daemon runs unchanged against either the real io_uring/system backend or the deterministic simulator (Deterministic Ocean). | `src/substrate/reactor.zig:4` |
 | **Helix** | The in-place `USR2` hot-upgrade: a replacement image is `execve`'d and adopts the running listener, live sessions, and the converged mesh view (each link's remote-member roster + the cross-mesh oper-grant registry) through typed migration capsules, with no connection-refused window. These capsules ride in memory across `execve`, so the carried mesh state survives a hot-upgrade but not a cold restart. | `src/daemon/helix/live.zig:4`, `src/substrate/upgrade_capsule.zig:4` |
 | **Koshi** | The operator-curated content filter: a small set of oper-curated patterns matched against outbound `PRIVMSG`/`NOTICE` bodies, where a hit blocks the message. | `src/daemon/content_filter.zig:4` |
-| **Tegami** (手紙) | Onyx Server-native offline messaging keyed by account: a direct message left for an account with no attached session is stored and delivered when that account next logs in (with an optional Web Push nudge). | `src/daemon/tegami.zig:4`, `src/proto/tegami_push_relay.zig:5` |
+| **Memo** | Onyx Server-native offline messaging keyed by account: a direct message left for an account with no attached session is stored and delivered when that account next logs in (with an optional Web Push nudge via local delivery and secured `MEMO_PUSH` mesh hints). | `src/daemon/memo.zig:4`, `src/proto/memo_push_relay.zig:4`, `src/proto/s2s_frame.zig:109` |
 
 ## Media codecs
 

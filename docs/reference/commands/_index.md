@@ -127,7 +127,7 @@ Registry commands default to registered-client access unless the command table s
 | `KEYTRANS` | Inspect account credential transparency roots and proofs. | [accounts-services.md](accounts-services.md#keytrans) |
 | `E2EEKEY` | Manage public account E2EE device-key advertisements. | [accounts-services.md](accounts-services.md#e2eekey) |
 | `IDENTITY` | Manage portable self-signed account identity keys. | [accounts-services.md](accounts-services.md#identity) |
-| `TEGAMI` | Offline account messages. | [accounts-services.md](accounts-services.md#tegami) |
+| `MEMO` | Offline account messages. | [accounts-services.md](accounts-services.md#memo) |
 | `VHOST` | Vhost wardrobe, requests, offers, and oper set. | [accounts-services.md](accounts-services.md#vhost) |
 | `PRIVS` | Show oper class and privileges. | [accounts-services.md](accounts-services.md#privs) |
 | `FILTER` | Oper content filter list/add/delete. | [accounts-services.md](accounts-services.md#filter) |

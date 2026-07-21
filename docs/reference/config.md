@@ -178,9 +178,11 @@ Live Undertow route-table and server-registry capacities. These keys are parsed 
 | `max_server_name_len` | integer | `63` | `16..255` | Max server-name bytes accepted by the registry. |
 | `max_server_desc_len` | integer | `255` | `32..1024` | Max server-description bytes accepted by the registry. |
 
-### `[mesh.gossip]`, `[mesh.sazanami]`, `[mesh.link]`
+### `[mesh.gossip]`, `[mesh.ripple]`, `[mesh.link]`
 
 Live S2S peer-driver tuning. `[mesh.link]` per-link `gossip_fanout` and view-capacity overrides are applied after `[mesh.gossip]` defaults.
+
+**Ripple keys** (witnessed failure detection) live under **`[mesh.ripple]`**. The older table name **`[mesh.sazanami]`** is a **legacy config path only** (same field names; not a command or IRC verb). Dual-read remains for operator migration: `mesh.sazanami.*` still loads, but prefer `mesh.ripple.*`. When both tables set the same field, **`mesh.ripple` wins**. Do not drop the dual-read without a migration note — live configs may still use `sazanami`.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
@@ -191,8 +193,8 @@ Live S2S peer-driver tuning. `[mesh.link]` per-link `gossip_fanout` and view-cap
 | `mesh.gossip.view_passive_capacity` | integer | `64` | `active+1..4096` | Bounded membership-view passive capacity. |
 | `mesh.gossip.view_shuffle_active` | integer | `2` | `0..active` | Active entries sampled per shuffle. |
 | `mesh.gossip.view_shuffle_passive` | integer | `4` | `0..passive` | Passive entries sampled per shuffle. |
-| `mesh.sazanami.suspicion_timeout_ms` | integer | `3000` | `0..120000` | Gossip-side suspect to dead reaping timeout. |
-| `mesh.sazanami.witness_quorum` | integer | `2` | `2..16` | Witness quorum for Ripple dead declaration. |
+| `mesh.ripple.suspicion_timeout_ms` | integer | `3000` | `0..120000` | Gossip-side suspect to dead reaping timeout. Preferred; legacy alias `mesh.sazanami.suspicion_timeout_ms`. |
+| `mesh.ripple.witness_quorum` | integer | `2` | `2..16` | Witness quorum for Ripple dead declaration. Preferred; legacy alias `mesh.sazanami.witness_quorum`. |
 | `mesh.link.send_credit_bytes` | integer | `65536` | `4096..16777216` | Initial peer-link flow-control send credit. |
 | `mesh.link.replay_window` | integer | `64` | `8..4096` | Anti-replay sequence window. |
 | `mesh.link.handshake_timeout_ms` | integer | `10000` | `1000..120000` | Peer-link handshake completion timeout. |
@@ -344,16 +346,16 @@ Durable account-services policy. These settings take effect when `[sasl].account
 
 ## `[bouncer]`
 
-Source: struct `Bouncer` in `src/daemon/config_format.zig`, parsing in `parseToml`, mapping in `src/daemon/config_boot.zig`, live Tegami store construction in `src/daemon/server.zig`.
+Source: struct `Bouncer` at `src/daemon/config_format.zig:556`, field defaults at `src/daemon/config_format.zig:558`, parsing at `src/daemon/config_format.zig:1237`, mapping at `src/daemon/config_boot.zig:179`, live `MemoBox` construction at `src/daemon/server.zig:4443` / `src/daemon/memo.zig:14`.
 
-Per-account bouncer/offline-message retention limits. These values construct the live Tegami offline-mail store at daemon boot.
+Per-account bouncer/offline-message retention limits. These values construct the live memo offline-mail store at daemon boot.
 
 | Key | Type | Default | Valid range | What it controls |
 |---|---|---:|---|---|
-| `tegami_text_max_len` | integer | `400` | `64..2048` | Max offline DM body length accepted by `TEGAMI SEND`. |
-| `tegami_from_max_len` | integer | `64` | `16..128` | Max sender label length stored on an offline DM. |
-| `tegami_mailbox_depth` | integer | `64` | `8..1024` | Per-account offline mailbox depth before new Tegami delivery fails closed. |
-| `tegami_max_accounts` | integer | `65536` | `1024..1048576` | Max distinct accounts with live offline mailboxes. |
+| `memo_text_max_len` | integer | `400` | `64..2048` | Max offline DM body length accepted by `MEMO SEND` (`src/daemon/memo.zig:14`, `src/daemon/config_format.zig:1237`). |
+| `memo_from_max_len` | integer | `64` | `16..128` | Max sender label length stored on an offline DM (`src/daemon/memo.zig:15`, `src/daemon/config_format.zig:1238`). |
+| `memo_mailbox_depth` | integer | `64` | `8..1024` | Per-account offline mailbox depth before new memo delivery fails closed (`src/daemon/memo.zig:16`, `src/daemon/config_format.zig:1239`). |
+| `memo_max_accounts` | integer | `65536` | `1024..1048576` | Max distinct accounts with live offline mailboxes (`src/daemon/memo.zig:17`, `src/daemon/config_format.zig:1240`). |
 
 ## `[filter]`
 
@@ -548,7 +550,7 @@ The cloak key is not a bare `SHA256(secret)`: `secret` (and `previous_secret`) a
 
 Source: struct at `src/daemon/config_format.zig:495`, parsing at `src/daemon/config_format.zig:866`.
 
-Browser [Web Push](web-push.md) delivery for offline direct messages (triggered by the `tegami` away-delivery path). Off by default; enabling it needs an account store (subscriptions are account-scoped) and outbound HTTPS (it reuses the same trust anchors as ACME). The VAPID public key is advertised to clients through an ISUPPORT `VAPID=` token; lifecycle visibility is published on the Event Spine.
+Browser [Web Push](web-push.md) delivery for offline direct messages (triggered by the `MEMO SEND` away-delivery path). Off by default; enabling it needs an account store (subscriptions are account-scoped) and outbound HTTPS (it reuses the same trust anchors as ACME). The VAPID public key is advertised to clients through an ISUPPORT `VAPID=` token; lifecycle visibility is published on the Event Spine.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
