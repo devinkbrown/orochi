@@ -334,7 +334,12 @@ pub const Config = struct {
         /// This is deliberately distinct from direct-neighbor `trust_roots`.
         relay_v2_roster: []const []const u8 = &.{},
         /// Runtime Undertow peer-driver limits/timers/capacities projected from
-        /// `[mesh.routing]`, `[mesh.link]`, `[mesh.gossip]`, and `[mesh.ripple]` (legacy TOML key: `mesh.sazanami`).
+        /// `[mesh.routing]`, `[mesh.link]`, `[mesh.gossip]`, and `[mesh.ripple]`.
+        ///
+        /// Ripple (witnessed failure detection) keys live under **`[mesh.ripple]`**.
+        /// The TOML table name **`[mesh.sazanami]`** is a **legacy config path only**
+        /// (etymology of Ripple) — dual-read for operator migration, not a command,
+        /// IRC verb, or runtime API. Prefer `mesh.ripple.*`; see `parseMeshS2sConfig`.
         s2s: s2s_peer_mod.Config = .{},
         /// Peers this node dials automatically at boot (and re-dials while the
         /// link is down), each a "host:port" string (IPv6 hosts bracketed,
@@ -1883,7 +1888,25 @@ fn parseMeshS2sConfig(doc: toml.Document, cfg: *s2s_peer_mod.Config) TomlError!v
     cfg.link.view_config.shuffle_active_count = @intCast(try uintField(doc, "mesh.gossip.view_shuffle_active", cfg.link.view_config.shuffle_active_count, 0, cfg.link.view_config.active_capacity));
     cfg.link.view_config.shuffle_passive_count = @intCast(try uintField(doc, "mesh.gossip.view_shuffle_passive", cfg.link.view_config.shuffle_passive_count, 0, cfg.link.view_config.passive_capacity));
 
-    // Prefer mesh.ripple.*; accept legacy mesh.sazanami.* for one rename window.
+    // Ripple config dual-read (operator migration window):
+    //
+    //   Preferred:  [mesh.ripple]  suspicion_timeout_ms / witness_quorum
+    //   Legacy:     [mesh.sazanami] same field names
+    //
+    // `sazanami` is a **legacy TOML config path only** — not a command, IRC
+    // verb, or public runtime name (Ripple is the subsystem). Do not drop the
+    // legacy keys without a migration note: operators may still ship
+    // `mesh.sazanami.*` in live files. Apply legacy first, then preferred, so
+    // when both tables set the same field **`mesh.ripple` wins**.
+    if (doc.getTable("mesh.sazanami") != null) {
+        // Once per process so REHASH / repeated --check-config does not spam.
+        const Deprecation = struct {
+            var warned: std.atomic.Value(bool) = .init(false);
+        };
+        if (!Deprecation.warned.swap(true, .monotonic)) {
+            std.log.warn("config: [mesh.sazanami] is a legacy TOML key; prefer [mesh.ripple] (same fields). Not a command.", .{});
+        }
+    }
     cfg.link.ripple_config.suspicion_timeout_ms = @intCast(try uintField(doc, "mesh.sazanami.suspicion_timeout_ms", @as(u64, @intCast(cfg.link.ripple_config.suspicion_timeout_ms)), 0, 120_000));
     cfg.link.ripple_config.suspicion_timeout_ms = @intCast(try uintField(doc, "mesh.ripple.suspicion_timeout_ms", @as(u64, @intCast(cfg.link.ripple_config.suspicion_timeout_ms)), 0, 120_000));
     // Floor of 2: a single accuser must never bury a peer (see gossip_round.zig
@@ -3022,6 +3045,49 @@ test "parseToml: live mesh S2S sub-sections project onto peer driver config" {
         \\view_active_capacity = 4
         \\
     , .{}));
+}
+
+test "parseToml: mesh.sazanami dual-read; mesh.ripple preferred when both set" {
+    const allocator = testing.allocator;
+
+    // Legacy-only table still loads (operator migration window).
+    {
+        const text =
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\[mesh.sazanami]
+            \\suspicion_timeout_ms = 7000
+            \\witness_quorum = 3
+            \\
+        ;
+        var cfg = try parseToml(allocator, text, .{});
+        defer cfg.deinit(allocator);
+        try testing.expectEqual(@as(i64, 7000), cfg.mesh.s2s.link.ripple_config.suspicion_timeout_ms);
+        try testing.expectEqual(@as(u8, 3), cfg.mesh.s2s.link.ripple_config.witness_quorum);
+    }
+
+    // When both tables set the same field, mesh.ripple wins.
+    {
+        const text =
+            \\[node]
+            \\id = 1
+            \\[listen]
+            \\irc = 6680
+            \\[mesh.sazanami]
+            \\suspicion_timeout_ms = 1000
+            \\witness_quorum = 2
+            \\[mesh.ripple]
+            \\suspicion_timeout_ms = 8000
+            \\witness_quorum = 5
+            \\
+        ;
+        var cfg = try parseToml(allocator, text, .{});
+        defer cfg.deinit(allocator);
+        try testing.expectEqual(@as(i64, 8000), cfg.mesh.s2s.link.ripple_config.suspicion_timeout_ms);
+        try testing.expectEqual(@as(u8, 5), cfg.mesh.s2s.link.ripple_config.witness_quorum);
+    }
 }
 
 test "parseToml: env: indirection resolves through the Resolver" {

@@ -324,9 +324,13 @@ view_passive_capacity = 64
 view_shuffle_active = 2
 view_shuffle_passive = 4
 
+# Preferred table for Ripple (witnessed failure detection).
+# Legacy dual-read: [mesh.sazanami] with the same field names is still accepted
+# for one rename window (config path only — not a command). Prefer this table;
+# when both are set, mesh.ripple wins.
 [mesh.ripple]
-# Ripple witnessed failure detection: gossip-side suspect reaping and the
-# witness quorum required before a peer is declared dead.
+# Gossip-side suspect reaping timeout and the witness quorum required before a
+# peer is declared dead.
 suspicion_timeout_ms = 3000
 # Minimum 2 — a single accuser must never bury a peer.
 witness_quorum = 2
