@@ -153,11 +153,8 @@ pub fn main(init: std.process.Init) !void {
         // flag and refuses a hot handoff unless the complete token matches.
         // This branch must stay ahead of all config, socket, and daemon setup.
         if (std.mem.eql(u8, first, onyx_server.daemon.helix.live.upgrade_capability_arg)) {
-            // Emit both brand tokens: a live Orochi predecessor exact-matches the
-            // OROCHI_ line; an already-renamed Onyx predecessor matches ONYX_.
-            // Caps sets are identical — only the product prefix differs.
-            std.debug.print("{s}\n{s}\n", .{
-                onyx_server.daemon.helix.live.upgrade_capability_token_legacy_orochi,
+            // English ONYX_ capability token only (no OROCHI_ brand alias).
+            std.debug.print("{s}\n", .{
                 onyx_server.daemon.helix.live.upgrade_capability_token,
             });
             return;

@@ -38,13 +38,13 @@ pub const Config = struct {
         return c;
     }
 
-    /// Overlay `[mesh.sazanami]` TOML keys onto this config. Missing keys leave the
+    /// Overlay `[mesh.ripple]` TOML keys onto this config. Missing keys leave the
     /// field at its current (default) value, preserving behavior.
     pub fn applyToml(cfg: *Config, doc: *const toml.Document) void {
-        if (doc.getInt("mesh.sazanami.probe_period_ms")) |v| cfg.period_ms = v;
-        if (doc.getUint("mesh.sazanami.indirect_probes")) |v| cfg.k = @intCast(v);
-        if (doc.getUint("mesh.sazanami.witness_quorum")) |v| cfg.quorum = @intCast(v);
-        if (doc.getInt("mesh.sazanami.suspect_timeout_ms")) |v| cfg.suspect_timeout_ms = v;
+        if (doc.getInt("mesh.ripple.probe_period_ms")) |v| cfg.period_ms = v;
+        if (doc.getUint("mesh.ripple.indirect_probes")) |v| cfg.k = @intCast(v);
+        if (doc.getUint("mesh.ripple.witness_quorum")) |v| cfg.quorum = @intCast(v);
+        if (doc.getInt("mesh.ripple.suspect_timeout_ms")) |v| cfg.suspect_timeout_ms = v;
     }
 };
 
@@ -561,10 +561,10 @@ test "newer incarnation refutes stale suspicion" {
     try testing.expectEqual(State.alive, det.status(6));
 }
 
-test "Config.applyToml overlays mesh.sazanami keys and leaves missing at defaults" {
+test "Config.applyToml overlays mesh.ripple keys and leaves missing at defaults" {
     const allocator = std.testing.allocator;
     var doc = try toml.parse(allocator,
-        \\[mesh.sazanami]
+        \\[mesh.ripple]
         \\probe_period_ms = 2500
         \\indirect_probes = 5
         \\witness_quorum = 4

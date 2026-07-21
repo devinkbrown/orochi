@@ -592,7 +592,7 @@ test "config text overlays the server config" {
         \\gossip_interval_ms = 1500
         \\[mesh.gossip]
         \\round_fanout = 5
-        \\[mesh.sazanami]
+        \\[mesh.ripple]
         \\witness_quorum = 4
         \\[history.search]
         \\max_words = 4096

@@ -33,14 +33,14 @@ pub const protocol_version: u16 = 1;
 pub const default_max_meshpass_len: usize = 4096;
 
 /// Operationally tunable max Mooring mesh-password length accepted in the
-/// handshake. Overridable via `[tls].mooring_max_meshpass_len` (legacy: `tsumugi_max_meshpass_len`); defaults
+/// handshake. Overridable via `[tls].mooring_max_meshpass_len`; defaults
 /// preserve prior behavior.
 pub var max_meshpass_len: usize = default_max_meshpass_len;
 
-/// Overlay `[tls].mooring_max_meshpass_len` (legacy tsumugi_*) onto the module-level meshpass cap.
+/// Overlay `[tls].mooring_max_meshpass_len` onto the module-level meshpass cap.
 /// Absent or zero values leave the current cap unchanged (behavior preserved).
 pub fn applyToml(doc: *const toml.Document) void {
-    if (doc.getUint("tls.mooring_max_meshpass_len") orelse doc.getUint("tls.tsumugi_max_meshpass_len")) |v| {
+    if (doc.getUint("tls.mooring_max_meshpass_len")) |v| {
         if (v != 0) max_meshpass_len = @intCast(v);
     }
 }
@@ -1264,19 +1264,19 @@ test "initiator identity and MeshPass are not cleartext in M1" {
     try std.testing.expect(!contains(m1, fx.cfg_i.mesh_pass));
 }
 
-test "applyToml overrides mooring_max_meshpass_len (and legacy tsumugi_*) and restores cleanly" {
+test "applyToml overrides mooring_max_meshpass_len and restores cleanly" {
     const saved = max_meshpass_len;
     defer max_meshpass_len = saved; // never leak the override into other tests
     const allocator = std.testing.allocator;
 
-    var doc = try toml.parse(allocator, "[tls]\ntsumugi_max_meshpass_len = 512\n");
+    var doc = try toml.parse(allocator, "[tls]\nmooring_max_meshpass_len = 512\n");
     defer doc.deinit(allocator);
     applyToml(&doc);
     try std.testing.expectEqual(@as(usize, 512), max_meshpass_len);
 
     // Absent / zero leaves the current value unchanged.
     max_meshpass_len = default_max_meshpass_len;
-    var zero = try toml.parse(allocator, "[tls]\ntsumugi_max_meshpass_len = 0\n");
+    var zero = try toml.parse(allocator, "[tls]\nmooring_max_meshpass_len = 0\n");
     defer zero.deinit(allocator);
     applyToml(&zero);
     try std.testing.expectEqual(default_max_meshpass_len, max_meshpass_len);

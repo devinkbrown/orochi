@@ -250,12 +250,12 @@ realm = "local"
 # secured links. When set, secured S2S expects peers to match these keys.
 # trust_roots = ["env:PEER_A_PUBKEY", "env:PEER_B_PUBKEY"]
 # Signed MeshPass admission. `admission_token` is this node's encoded MeshPass
-# token (hex or standard base64) sent inside encrypted Tsumugi M1. When
+# token (hex or standard base64) sent inside encrypted Mooring M1. When
 # `admission_roots` is non-empty, secured-S2S responders require peers to
 # present a token signed by one of these Ed25519 roots, bound to the peer node
-# key, carrying relay role and control/sync/irc_app/tsumugi frame families.
+# key, carrying relay role and control/sync/irc_app/mooring frame families.
 # This requires secured S2S identity/crypto; if roots are configured but the
-# Tsumugi secured-S2S path is unavailable, server init fails closed.
+# Mooring secured-S2S path is unavailable, server init fails closed.
 # admission_token = "env:ONYX_MESHPASS_TOKEN"
 # admission_roots = ["env:ONYX_MESHPASS_ROOT"]
 # admission_min_revocation_epoch = 0
@@ -286,7 +286,7 @@ realm = "local"
 # Requires [listen].s2s on the remote node. Empty/absent = no auto-connect.
 # connect = ["ircx.us:6900"]
 # Refuse plaintext S2S entirely: reject inbound plaintext peers and never dial
-# plaintext outbound. Only the Tsumugi-secured path is allowed; if secured S2S
+# plaintext outbound. Only the Mooring-secured path is allowed; if secured S2S
 # is not configured (no [node].secret_key / key file), ALL S2S is dropped rather
 # than falling back to clear. Default false keeps the plaintext fallback.
 # require_secured = true
@@ -325,7 +325,6 @@ view_shuffle_active = 2
 view_shuffle_passive = 4
 
 # Preferred table for Ripple (witnessed failure detection).
-# Legacy dual-read: [mesh.sazanami] with the same field names is still accepted
 # for one rename window (config path only — not a command). Prefer this table;
 # when both are set, mesh.ripple wins.
 [mesh.ripple]

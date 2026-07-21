@@ -29,10 +29,10 @@ pub const RippleConfig = struct {
         return c;
     }
 
-    /// Overlay `[mesh.sazanami]` keys onto this config.
+    /// Overlay `[mesh.ripple]` keys onto this config.
     pub fn applyToml(cfg: *RippleConfig, doc: *const toml.Document) void {
-        if (doc.getInt("mesh.sazanami.suspicion_timeout_ms")) |v| cfg.suspicion_timeout_ms = v;
-        if (doc.getUint("mesh.sazanami.witness_quorum")) |v| cfg.witness_quorum = @intCast(v);
+        if (doc.getInt("mesh.ripple.suspicion_timeout_ms")) |v| cfg.suspicion_timeout_ms = v;
+        if (doc.getUint("mesh.ripple.witness_quorum")) |v| cfg.witness_quorum = @intCast(v);
     }
 };
 
@@ -752,13 +752,13 @@ test "rounds are deterministic with the same seed" {
     try testing.expectEqualSlices(Suspicion, ra.payload.suspicions.items, rb.payload.suspicions.items);
 }
 
-test "Config/RippleConfig applyToml overlay mesh.gossip + mesh.sazanami keys" {
+test "Config/RippleConfig applyToml overlay mesh.gossip + mesh.ripple keys" {
     const allocator = std.testing.allocator;
     var doc = try toml.parse(allocator,
         \\[mesh.gossip]
         \\round_fanout = 7
         \\max_suspicions = 99
-        \\[mesh.sazanami]
+        \\[mesh.ripple]
         \\suspicion_timeout_ms = 4000
         \\witness_quorum = 5
     );

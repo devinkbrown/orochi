@@ -611,7 +611,7 @@ test "Config.applyToml composite delegates to views/broadcaster/ripple and rng_s
         \\[mesh.gossip]
         \\active_view_max = 12
         \\graft_retry_ms = 500
-        \\[mesh.sazanami]
+        \\[mesh.ripple]
         \\indirect_probes = 7
     );
     defer doc.deinit(allocator);
