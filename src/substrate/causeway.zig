@@ -254,7 +254,7 @@ test "RTP <-> bridge round-trips through a PT map" {
     map.add(111, .cadencevox);
     map.add(96, .cadencevis);
 
-    const bf = BridgeFrame{ .codec = .cadencevox, .timestamp = 0x1_0000_0040, .sequence = 0x1_0005, .keyframe = true, .payload = "kaguravox-frame" };
+    const bf = BridgeFrame{ .codec = .cadencevox, .timestamp = 0x1_0000_0040, .sequence = 0x1_0005, .keyframe = true, .payload = "cadencevox-frame" };
     var buf: [128]u8 = undefined;
     const rtp = try toRtp(bf, &map, 0xCAFEBABE, &buf);
 
@@ -263,7 +263,7 @@ test "RTP <-> bridge round-trips through a PT map" {
     try testing.expectEqual(@as(u32, 0x0005), got.sequence); // truncated to 16 bits
     try testing.expectEqual(@as(u64, 0x0000_0040), got.timestamp); // truncated to 32 bits
     try testing.expect(got.keyframe); // marker set from keyframe
-    try testing.expectEqualStrings("kaguravox-frame", got.payload);
+    try testing.expectEqualStrings("cadencevox-frame", got.payload);
 
     // unknown PT is rejected
     var empty = PtMap{};
